@@ -17,6 +17,7 @@ package ipv4_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"math"
 	"net"
@@ -116,19 +117,25 @@ func TestIPv4Sanity(t *testing.T) {
 	)
 
 	tests := []struct {
-		name              string
-		headerLength      uint8 // value of 0 means "use correct size"
-		maxTotalLength    uint16
-		transportProtocol uint8
-		TTL               uint8
-		shouldFail        bool
-		expectICMP        bool
-		ICMPType          header.ICMPv4Type
-		ICMPCode          header.ICMPv4Code
-		options           []byte
+		name                string
+		headerLength        uint8 // value of 0 means "use correct size"
+		maxTotalLength      uint16
+		transportProtocol   uint8
+		TTL                 uint8
+		options             []byte
+		replyOptions        []byte // if succeeds, reply should look like this
+		shouldFail          bool
+		expectErrorICMP     bool
+		ICMPType            header.ICMPv4Type
+		ICMPCode            header.ICMPv4Code
+		paramProblemPointer uint8
+		// TODO(gvisor.dev/issues/4036): When FakeClock becomes available check
+		// the timestamp value. Until then as a work around just clear out the
+		// last 4 bytes of the option where the new timestamp will be put.
+		maskLast4 bool
 	}{
 		{
-			name:              "valid",
+			name:              "valid no options",
 			maxTotalLength:    defaultMTU,
 			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
 			TTL:               ttl,
@@ -149,14 +156,12 @@ func TestIPv4Sanity(t *testing.T) {
 			maxTotalLength:    defaultMTU,
 			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
 			TTL:               0,
-			shouldFail:        false,
 		},
 		{
 			name:              "one TTL",
 			maxTotalLength:    defaultMTU,
 			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
 			TTL:               1,
-			shouldFail:        false,
 		},
 		{
 			name:              "End options",
@@ -164,6 +169,7 @@ func TestIPv4Sanity(t *testing.T) {
 			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
 			TTL:               ttl,
 			options:           []byte{0, 0, 0, 0},
+			replyOptions:      []byte{0, 0, 0, 0},
 		},
 		{
 			name:              "NOP options",
@@ -171,6 +177,7 @@ func TestIPv4Sanity(t *testing.T) {
 			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
 			TTL:               ttl,
 			options:           []byte{1, 1, 1, 1},
+			replyOptions:      []byte{1, 1, 1, 1},
 		},
 		{
 			name:              "NOP and End options",
@@ -178,6 +185,7 @@ func TestIPv4Sanity(t *testing.T) {
 			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
 			TTL:               ttl,
 			options:           []byte{1, 1, 0, 0},
+			replyOptions:      []byte{1, 1, 0, 0},
 		},
 		{
 			name:              "bad header length",
@@ -186,7 +194,6 @@ func TestIPv4Sanity(t *testing.T) {
 			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
 			TTL:               ttl,
 			shouldFail:        true,
-			expectICMP:        false,
 		},
 		{
 			name:              "bad total length (0)",
@@ -194,7 +201,6 @@ func TestIPv4Sanity(t *testing.T) {
 			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
 			TTL:               ttl,
 			shouldFail:        true,
-			expectICMP:        false,
 		},
 		{
 			name:              "bad total length (ip - 1)",
@@ -202,7 +208,6 @@ func TestIPv4Sanity(t *testing.T) {
 			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
 			TTL:               ttl,
 			shouldFail:        true,
-			expectICMP:        false,
 		},
 		{
 			name:              "bad total length (ip + icmp - 1)",
@@ -210,7 +215,6 @@ func TestIPv4Sanity(t *testing.T) {
 			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
 			TTL:               ttl,
 			shouldFail:        true,
-			expectICMP:        false,
 		},
 		{
 			name:              "bad protocol",
@@ -218,9 +222,213 @@ func TestIPv4Sanity(t *testing.T) {
 			transportProtocol: 99,
 			TTL:               ttl,
 			shouldFail:        true,
-			expectICMP:        true,
+			expectErrorICMP:   true,
 			ICMPType:          header.ICMPv4DstUnreachable,
 			ICMPCode:          header.ICMPv4ProtoUnreachable,
+		},
+		{
+			name:              "timestamp option overflow",
+			maxTotalLength:    defaultMTU,
+			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
+			TTL:               ttl,
+			options: []byte{
+				68, 12, 13, 0x11,
+				192, 168, 1, 12,
+				1, 2, 3, 4,
+			},
+			replyOptions: []byte{
+				68, 12, 13, 0x21,
+				192, 168, 1, 12,
+				1, 2, 3, 4,
+			},
+		},
+		{
+			name:              "timestamp option overflow full",
+			maxTotalLength:    defaultMTU,
+			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
+			TTL:               ttl,
+			options: []byte{
+				68, 12, 13, 0xF1,
+				//            ^   Counter full (15/0xF)
+				192, 168, 1, 12,
+				1, 2, 3, 4,
+			},
+			shouldFail:          true,
+			expectErrorICMP:     true,
+			ICMPType:            header.ICMPv4ParamProblem,
+			ICMPCode:            header.ICMPv4UnusedCode,
+			paramProblemPointer: 23,
+			replyOptions:        []byte{},
+		},
+		{
+			name:              "unknown option",
+			maxTotalLength:    defaultMTU,
+			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
+			TTL:               ttl,
+			options:           []byte{10, 4, 9, 0},
+			//                        ^^
+			shouldFail: true,
+		},
+		{
+			name:              "bad option - length 0",
+			maxTotalLength:    defaultMTU,
+			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
+			TTL:               ttl,
+			options: []byte{
+				68, 0, 9, 0,
+				//  ^
+				1, 2, 3, 4,
+			},
+			shouldFail: true,
+		},
+		{
+			name:              "bad option - length big",
+			maxTotalLength:    defaultMTU,
+			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
+			TTL:               ttl,
+			options: []byte{
+				68, 9, 9, 0,
+				//  ^
+				// There are only 8 bytes allocated to options so 9 bytes of timestamp
+				// space is not possible. (Second byte)
+				1, 2, 3, 4,
+			},
+			shouldFail: true,
+		},
+		{
+			name:              "bad option - length bad",
+			maxTotalLength:    defaultMTU,
+			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
+			TTL:               ttl,
+			// Timestamps are in multiples of 4 or 8 but never 7.
+			// The option space should be padded out.
+			options: []byte{
+				68, 7, 8, 0,
+				//  ^   Not a multiple of 4
+				1, 2, 3,
+			},
+			shouldFail: true,
+		},
+		{
+			name:              "multiple type 0 with room",
+			maxTotalLength:    defaultMTU,
+			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
+			TTL:               ttl,
+			options: []byte{
+				68, 24, 21, 0x00,
+				1, 2, 3, 4,
+				5, 6, 7, 8,
+				9, 10, 11, 12,
+				13, 14, 15, 16,
+				0, 0, 0, 0,
+			},
+			replyOptions: []byte{
+				68, 24, 25, 0x00,
+				1, 2, 3, 4,
+				5, 6, 7, 8,
+				9, 10, 11, 12,
+				13, 14, 15, 16,
+				0, 0, 0, 0,
+			},
+			maskLast4: true,
+		},
+		{
+			// The timestamp area is full so add to the overflow count.
+			name:              "multiple type 1 timestamps",
+			maxTotalLength:    defaultMTU,
+			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
+			TTL:               ttl,
+			options: []byte{
+				68, 20, 21, 0x11,
+				//            ^
+				192, 168, 1, 12,
+				1, 2, 3, 4,
+				192, 168, 1, 13,
+				5, 6, 7, 8,
+			},
+			// Overflow count is the top nibble of the 4th byte.
+			replyOptions: []byte{
+				68, 20, 21, 0x21,
+				//            ^
+				192, 168, 1, 12,
+				1, 2, 3, 4,
+				192, 168, 1, 13,
+				5, 6, 7, 8,
+			},
+		},
+		{
+			name:              "multiple type 1 timestamps with room",
+			maxTotalLength:    defaultMTU,
+			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
+			TTL:               ttl,
+			options: []byte{
+				68, 28, 21, 0x01,
+				192, 168, 1, 12,
+				1, 2, 3, 4,
+				192, 168, 1, 13,
+				5, 6, 7, 8,
+				0, 0, 0, 0,
+				0, 0, 0, 0,
+			},
+			replyOptions: []byte{
+				68, 28, 29, 0x01,
+				192, 168, 1, 12,
+				1, 2, 3, 4,
+				192, 168, 1, 13,
+				5, 6, 7, 8,
+				192, 168, 1, 58, // <<-- New IP Address.
+				0, 0, 0, 0, // <<-- Time stamp will go here
+			},
+			maskLast4: true,
+		},
+		{
+			// Needs 8 bytes for a type 1 timestamp but there are only 4 free.
+			name:              "bad timer element alignment",
+			maxTotalLength:    defaultMTU,
+			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
+			TTL:               ttl,
+			options: []byte{
+				68, 16, 13, 0x01,
+				//  ^^  ^^   16 byte area, next free spot at 13.
+				192, 168, 1, 12,
+				1, 2, 3, 4,
+				0, 0, 0, 0,
+			},
+			shouldFail:          true,
+			expectErrorICMP:     true,
+			ICMPType:            header.ICMPv4ParamProblem,
+			ICMPCode:            header.ICMPv4UnusedCode,
+			paramProblemPointer: 22,
+			replyOptions:        []byte{},
+		},
+		// End of option list with illegal option after it, which should be ignored.
+		{
+			name:              "end of options list",
+			maxTotalLength:    defaultMTU,
+			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
+			TTL:               ttl,
+			options: []byte{
+				68, 12, 13, 0x11,
+				192, 168, 1, 12,
+				1, 2, 3, 4,
+				0, 10, 3, 99,
+			},
+			replyOptions: []byte{
+				68, 12, 13, 0x21,
+				192, 168, 1, 12,
+				1, 2, 3, 4,
+				0, 0, 0, 0, // <-- 3 bytes unknown option
+			}, //   ^  End of options hides following bytes.
+		},
+		{
+			// Timestamp with a size too small.
+			name:              "truncated",
+			maxTotalLength:    defaultMTU,
+			transportProtocol: uint8(header.ICMPv4ProtocolNumber),
+			TTL:               ttl,
+			options:           []byte{68, 1, 0, 0},
+			//                            ^ Smallest possible is 8.
+			shouldFail: true,
 		},
 	}
 
@@ -295,7 +503,7 @@ func TestIPv4Sanity(t *testing.T) {
 			reply, ok := e.Read()
 			if !ok {
 				if test.shouldFail {
-					if test.expectICMP {
+					if test.expectErrorICMP {
 						t.Fatal("expected ICMP error response missing")
 					}
 					return // Expected silent failure.
@@ -329,6 +537,26 @@ func TestIPv4Sanity(t *testing.T) {
 
 			// Sanity check the response.
 			switch replyICMPHeader.Type() {
+			case header.ICMPv4ParamProblem:
+				checker.IPv4(t, replyIPHeader,
+					checker.IPFullLength(uint16(header.IPv4MinimumSize+header.ICMPv4MinimumSize+requestPkt.Size())),
+					checker.IPv4HeaderLength(header.IPv4MinimumSize),
+					checker.ICMPv4(
+						checker.ICMPv4Code(test.ICMPCode),
+						checker.ICMPv4Checksum(),
+						checker.ICMPv4Payload([]byte(hdr.View())),
+					),
+				)
+				if !test.shouldFail {
+					t.Fatalf("Unexpected packet rejection, got Paramter Problem with pointer %d", replyICMPHeader.Pointer())
+				}
+				if test.ICMPType != header.ICMPv4ParamProblem {
+					t.Fatalf("Unexpected ICMP response, got Paramter Problem with pointer %d", replyICMPHeader.Pointer())
+				}
+				if got, want := replyICMPHeader.Pointer(), test.paramProblemPointer; got != want {
+					t.Fatalf("Unexpected Paramter Problem pointer = %d, want = %d", got, want)
+				}
+				return
 			case header.ICMPv4DstUnreachable:
 				checker.IPv4(t, replyIPHeader,
 					checker.IPFullLength(uint16(header.IPv4MinimumSize+header.ICMPv4MinimumSize+requestPkt.Size())),
@@ -339,7 +567,7 @@ func TestIPv4Sanity(t *testing.T) {
 						checker.ICMPv4Payload([]byte(hdr.View())),
 					),
 				)
-				if !test.shouldFail || !test.expectICMP {
+				if !test.shouldFail || !test.expectErrorICMP {
 					t.Fatalf("unexpected packet rejection, got ICMP error packet type %d, code %d",
 						header.ICMPv4DstUnreachable, replyICMPHeader.Code())
 				}
@@ -347,7 +575,7 @@ func TestIPv4Sanity(t *testing.T) {
 			case header.ICMPv4EchoReply:
 				checker.IPv4(t, replyIPHeader,
 					checker.IPv4HeaderLength(ipHeaderLength),
-					checker.IPv4Options(test.options),
+					// checker.IPv4Options(options),  // See TODO below
 					checker.IPFullLength(uint16(requestPkt.Size())),
 					checker.ICMPv4(
 						checker.ICMPv4Code(header.ICMPv4UnusedCode),
@@ -359,9 +587,27 @@ func TestIPv4Sanity(t *testing.T) {
 				if test.shouldFail {
 					t.Fatalf("unexpected Echo Reply packet\n")
 				}
+				// Now go back to the options themselves.
+				options := replyIPHeader.Options()
+				if len(options) != len(test.replyOptions) {
+					t.Fatalf("Options changed size got = %d, want=%d", len(options), len(test.options))
+				}
+				// TODO(gvisor.dev/issues/4036): When FakeClock becomes available check
+				// the timestamp value. Until then as a work around just clear out the
+				// last 4 bytes of the option where the new timestamp will be put.
+				if test.maskLast4 {
+					val := binary.BigEndian.Uint32(options[len(options)-4:])
+					if got, dontWant := val, uint32(0); got == dontWant {
+						t.Errorf(" Timestamp not set: got = %d, don't want %d", got, dontWant)
+					}
+					binary.BigEndian.PutUint32(options[len(options)-4:], 0)
+				}
+				if !bytes.Equal(options, test.replyOptions) {
+					t.Fatalf("Options changed\ngot:\n%s\nwant:\n%s", hex.Dump(options), hex.Dump(test.options))
+				}
 			default:
-				t.Fatalf("unexpected ICMP response, got type %d, want = %d or %d",
-					replyICMPHeader.Type(), header.ICMPv4EchoReply, header.ICMPv4DstUnreachable)
+				t.Fatalf("unexpected ICMP response, got type %d, want = %d, %d or %d",
+					replyICMPHeader.Type(), header.ICMPv4EchoReply, header.ICMPv4DstUnreachable, header.ICMPv4ParamProblem)
 			}
 		})
 	}

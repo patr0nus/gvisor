@@ -1791,7 +1791,6 @@ func TestV4UnknownDestination(t *testing.T) {
 				// had only a minimal IP header but the ICMP sender will have allowed
 				// for a maximally sized packet header.
 				wantLen = header.IPv4MinimumProcessableDatagramSize - header.IPv4MaximumHeaderSize - header.ICMPv4MinimumSize - incomingHeaderLength
-
 			}
 
 			// In the case of large payloads the IP packet may be truncated. Update
