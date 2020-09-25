@@ -15,6 +15,8 @@
 package stack
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
@@ -61,6 +63,62 @@ const (
 	ControlUnknown
 )
 
+// LinkPacketInfo holds information about a link layer packet.
+type LinkPacketInfo struct {
+	// NetProto is the network layer protocol. That is, NetProto holds the
+	// protocol for the packet that the link layer packet encapsulates.
+	NetProto tcpip.NetworkProtocolNumber
+
+	// NICID is the ID of the NIC this packet will be sent through, or received
+	// from.
+	NICID tcpip.NICID
+
+	// RemoteLinkAddress is the packet's remote link address.
+	//
+	// For incoming packets, RemoteLinkAddress holds the source link address; for
+	// outgoing packets, RemoteLinkAddress holds the destination link address.
+	RemoteLinkAddress tcpip.LinkAddress
+
+	// LocalLinkAddress is the packet's local link address.
+	//
+	// For incoming packets, LocalLinkAddress holds the destination link address;
+	// for outgoing packets, LocalLinkAddress holds the source link address.
+	LocalLinkAddress tcpip.LinkAddress
+
+	// InterfaceCapabilities are the capabilities available to the interface when
+	// the packet was received.
+	//
+	// Ignored for outgoing packets.
+	InterfaceCapabilities LinkEndpointCapabilities
+}
+
+// NetworkPacketInfo holds information about a network layer packet.
+type NetworkPacketInfo struct {
+	// LinkPacketInfo holds link-layer information.
+	LinkPacketInfo LinkPacketInfo
+
+	// Broadcast is true if the packet is a broadcast packet. That is, a packet is
+	// considered a broadcast packet when its destination address is a broadcast
+	// address.
+	Broadcast bool
+
+	// RemoteAddress is the packet's remote address.
+	//
+	// For incoming packets, RemoteAddress holds the source address; for outgoing
+	// packets, RemoteAddress holds the destination address.
+	RemoteAddress tcpip.Address
+
+	// LocalAddress is the packet's local address.
+	//
+	// For incoming packets, LocalAddress holds the destination address; for
+	// outgoing packets, LocalAddress holds the source address.
+	LocalAddress tcpip.Address
+
+	// LocalAddressBroadcast is true when an incoming packet's source address is a
+	// broadcast address.
+	LocalAddressBroadcast bool
+}
+
 // TransportEndpoint is the interface that needs to be implemented by transport
 // protocol (e.g., tcp, udp) endpoints that can handle packets.
 type TransportEndpoint interface {
@@ -71,7 +129,7 @@ type TransportEndpoint interface {
 	// this transport endpoint. It sets pkt.TransportHeader.
 	//
 	// HandlePacket takes ownership of pkt.
-	HandlePacket(r *Route, id TransportEndpointID, pkt *PacketBuffer)
+	HandlePacket(r NetworkPacketInfo, id TransportEndpointID, pkt *PacketBuffer)
 
 	// HandleControlPacket is called by the stack when new control (e.g.
 	// ICMP) packets arrive to this transport endpoint.
@@ -104,7 +162,7 @@ type RawTransportEndpoint interface {
 	// layer up.
 	//
 	// HandlePacket takes ownership of pkt.
-	HandlePacket(r *Route, pkt *PacketBuffer)
+	HandlePacket(r NetworkPacketInfo, pkt *PacketBuffer)
 }
 
 // PacketEndpoint is the interface that needs to be implemented by packet
@@ -152,10 +210,10 @@ type TransportProtocol interface {
 	Number() tcpip.TransportProtocolNumber
 
 	// NewEndpoint creates a new endpoint of the transport protocol.
-	NewEndpoint(stack *Stack, netProto tcpip.NetworkProtocolNumber, waitQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error)
+	NewEndpoint(netProto tcpip.NetworkProtocolNumber, waitQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error)
 
 	// NewRawEndpoint creates a new raw endpoint of the transport protocol.
-	NewRawEndpoint(stack *Stack, netProto tcpip.NetworkProtocolNumber, waitQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error)
+	NewRawEndpoint(netProto tcpip.NetworkProtocolNumber, waitQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error)
 
 	// MinimumPacketSize returns the minimum valid packet size of this
 	// transport protocol. The stack automatically drops any packets smaller
@@ -172,7 +230,7 @@ type TransportProtocol interface {
 	//
 	// HandleUnknownDestinationPacket takes ownership of pkt if it handles
 	// the issue.
-	HandleUnknownDestinationPacket(r *Route, id TransportEndpointID, pkt *PacketBuffer) UnknownDestinationPacketDisposition
+	HandleUnknownDestinationPacket(r NetworkPacketInfo, id TransportEndpointID, pkt *PacketBuffer) UnknownDestinationPacketDisposition
 
 	// SetOption allows enabling/disabling protocol specific features.
 	// SetOption returns an error if the option is not supported or the
@@ -222,7 +280,7 @@ type TransportDispatcher interface {
 	// pkt.NetworkHeader must be set before calling DeliverTransportPacket.
 	//
 	// DeliverTransportPacket takes ownership of pkt.
-	DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition
+	DeliverTransportPacket(r NetworkPacketInfo, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) TransportPacketDisposition
 
 	// DeliverTransportControlPacket delivers control packets to the
 	// appropriate transport protocol endpoint.
@@ -259,9 +317,254 @@ type NetworkHeaderParams struct {
 	TOS uint8
 }
 
+// GroupAddressableEndpoint is an endpoint that supports group addressing.
+//
+// An endpoint is considered to support group addressing when one or more
+// endpoints may associate themselves with the same identifier (group address).
+type GroupAddressableEndpoint interface {
+	// JoinGroup joins the spcified group.
+	//
+	// Returns true if the group was newly joined.
+	JoinGroup(group tcpip.Address) (bool, *tcpip.Error)
+
+	// LeaveGroup attempts to leave the specified group.
+	//
+	// Returns tcpip.ErrBadLocalAddress if the endpoint has not joined the group.
+	LeaveGroup(group tcpip.Address) (bool, *tcpip.Error)
+
+	// IsInGroup returns true if the endpoint is a member of the specified group.
+	IsInGroup(group tcpip.Address) bool
+}
+
+// PrimaryEndpointBehavior is an enumeration of an AddressEndpoint's primary
+// behavior.
+type PrimaryEndpointBehavior int
+
+const (
+	// CanBePrimaryEndpoint indicates the endpoint can be used as a primary
+	// endpoint for new connections with no local address. This is the
+	// default when calling NIC.AddAddress.
+	CanBePrimaryEndpoint PrimaryEndpointBehavior = iota
+
+	// FirstPrimaryEndpoint indicates the endpoint should be the first
+	// primary endpoint considered. If there are multiple endpoints with
+	// this behavior, they are ordered by recency.
+	FirstPrimaryEndpoint
+
+	// NeverPrimaryEndpoint indicates the endpoint should never be a
+	// primary endpoint.
+	NeverPrimaryEndpoint
+)
+
+// AddressConfigType is the method used to add an address.
+type AddressConfigType int
+
+const (
+	// AddressConfigStatic is a statically configured address endpoint that was
+	// added by some user-specified action (adding an explicit address, joining a
+	// multicast group).
+	AddressConfigStatic AddressConfigType = iota
+
+	// AddressConfigSlaac is an address endpoint added by SLAAC, as per RFC 4862
+	// section 5.5.3.
+	AddressConfigSlaac
+
+	// AddressConfigSlaacTemp is a temporary address endpoint added by SLAAC as
+	// per RFC 4941. Temporary SLAAC addresses are short-lived and are not
+	// to be valid (or preferred) forever; hence the term temporary.
+	AddressConfigSlaacTemp
+)
+
+// AssignableAddressEndpoint is a reference counted address endpoint that may be
+// assigned to a NetworkEndpoint.
+type AssignableAddressEndpoint interface {
+	// NetworkEndpoint returns the NetworkEndpoint the receiver is associated
+	// with.
+	NetworkEndpoint() NetworkEndpoint
+
+	// AddressWithPrefix returns the endpoint's address.
+	AddressWithPrefix() tcpip.AddressWithPrefix
+
+	// IsAssigned returns whether or not the endpoint is considered bound
+	// to its NetworkEndpoint.
+	IsAssigned(allowExpired bool) bool
+
+	// IncRef increments this endpoint's reference count.
+	//
+	// Returns true if it was successfully incremented. If it returns false, then
+	// the endpoint is considered expired and should no longer be used.
+	IncRef() bool
+
+	// DecRef decrements this endpoint's reference count.
+	DecRef()
+}
+
+// AddressEndpoint is an endpoint representing an address assigned to an
+// AddressableEndpoint.
+type AddressEndpoint interface {
+	AssignableAddressEndpoint
+
+	// GetKind returns the address kind for this endpoint.
+	GetKind() AddressKind
+
+	// SetKind sets the address kind for this endpoint.
+	SetKind(AddressKind)
+
+	// ConfigType returns the method used to add the address.
+	ConfigType() AddressConfigType
+
+	// Deprecated returns whether or not this endpoint is deprecated.
+	Deprecated() bool
+
+	// SetDeprecated sets this endpoint's deprecated status.
+	SetDeprecated(bool)
+}
+
+// AddressKind is the kind of of an address.
+//
+// See the values of AddressKind for more details.
+type AddressKind int
+
+const (
+	// PermanentTentative is a permanent address endpoint that is not yet
+	// considered to be fully bound to an interface in the traditional
+	// sense. That is, the address is associated with a NIC, but packets
+	// destined to the address MUST NOT be accepted and MUST be silently
+	// dropped, and the address MUST NOT be used as a source address for
+	// outgoing packets. For IPv6, addresses are of this kind until NDP's
+	// Duplicate Address Detection (DAD) resolves. If DAD fails, the address
+	// is removed.
+	PermanentTentative AddressKind = iota
+
+	// Permanent is a permanent endpoint (vs. a temporary one) assigned to the
+	// NIC. Its reference count is biased by 1 to avoid removal when no route
+	// holds a reference to it. It is removed by explicitly removing the address
+	// from the NIC.
+	Permanent
+
+	// PermanentExpired is a permanent endpoint that had its address removed from
+	// the NIC, and it is waiting to be removed once no references to it are held.
+	//
+	// If the address is re-added before the endpoint is removed, its type
+	// changes back to Permanent.
+	PermanentExpired
+
+	// Temporary is an endpoint, created on a one-off basis to temporarily
+	// consider the NIC bound an an address that it is not explictiy bound to
+	// (such as a permanent address). Its reference count must not be biased by 1
+	// so that the address is removed immediately when references to it are no
+	// longer held.
+	//
+	// A temporary endpoint may be promoted to permanent if the address is added
+	// permanently.
+	Temporary
+)
+
+// IsPermanent returns true if the AddressKind represents a permanent address.
+func (k AddressKind) IsPermanent() bool {
+	switch k {
+	case Permanent, PermanentTentative:
+		return true
+	case Temporary, PermanentExpired:
+		return false
+	default:
+		panic(fmt.Sprintf("unrecognized address kind = %d", k))
+	}
+}
+
+// AddressableEndpoint is an endpoint that supports addressing.
+//
+// An endpoint is considered to support addressing when the endpoint may
+// associate itself with an identifier (address).
+type AddressableEndpoint interface {
+	// AddAndAcquirePermanentAddress adds the passed permanent address.
+	//
+	// Returns tcpip.ErrDuplicateAddress if the address exists.
+	//
+	// Acquires and returns the AddressEndpoint for the added address.
+	AddAndAcquirePermanentAddress(addr tcpip.AddressWithPrefix, peb PrimaryEndpointBehavior, configType AddressConfigType, deprecated bool) (AddressEndpoint, *tcpip.Error)
+
+	// RemovePermanentAddress removes the passed address if it is a permanent
+	// address.
+	//
+	// Returns tcpip.ErrBadLocalAddress if the endpoint does not have the passed
+	// permanent address.
+	RemovePermanentAddress(addr tcpip.Address) *tcpip.Error
+
+	// AcquireAssignedAddress returns an AddressEndpoint for the passed address
+	// that is considered bound to the endpoint, optionally creating a temporary
+	// endpoint if requested and no existing address exists.
+	//
+	// The returned endpoint's reference count is incremented.
+	//
+	// Returns nil if the specified address is not local to this endpoint.
+	AcquireAssignedAddress(localAddr tcpip.Address, allowTemp bool, tempPEB PrimaryEndpointBehavior) AddressEndpoint
+
+	// AcquirePrimaryAddress returns a primary endpoint to use when communicating
+	// with the passed remote address.
+	//
+	// If allowExpired is true, expired addresses may be returned.
+	//
+	// The returned endpoint's reference count is incremented.
+	//
+	// Returns nil if a primary endpoint is not available.
+	AcquirePrimaryAddress(remoteAddr tcpip.Address, allowExpired bool) AddressEndpoint
+
+	// PrimaryAddresses returns the primary addresses.
+	PrimaryAddresses() []tcpip.AddressWithPrefix
+
+	// PermanentAddresses returns all the permanent addresses.
+	PermanentAddresses() []tcpip.AddressWithPrefix
+}
+
+// NDPEndpoint is a network endpoint that supports NDP.
+type NDPEndpoint interface {
+	NetworkEndpoint
+
+	// InvalidateDefaultRouter invalidates a default router discovered through
+	// NDP.
+	InvalidateDefaultRouter(tcpip.Address)
+}
+
+// NetworkInterface is a network interface.
+type NetworkInterface interface {
+	// ID returns the interface's ID.
+	ID() tcpip.NICID
+
+	// IsLoopback returns true if the interface is a loopback interface.
+	IsLoopback() bool
+
+	// Name returns the name of the interface.
+	//
+	// May return an empty string if the interface is not configured with a name.
+	Name() string
+
+	// Enabled returns true if the interface is enabled.
+	Enabled() bool
+
+	// LinkEndpoint returns the link endpoint backing the interface.
+	LinkEndpoint() LinkEndpoint
+}
+
 // NetworkEndpoint is the interface that needs to be implemented by endpoints
 // of network layer protocols (e.g., ipv4, ipv6).
 type NetworkEndpoint interface {
+	AddressableEndpoint
+
+	// Enable enables the endpoint.
+	//
+	// Must only be called when the stack is in a state that allows the endpoint
+	// to send and receive packets.
+	//
+	// Returns tcpip.ErrNotPermitted if the endpoint cannot be enabled.
+	Enable() *tcpip.Error
+
+	// Enabled returns true if the endpoint is enabled.
+	Enabled() bool
+
+	// Disable disables the endpoint.
+	Disable()
+
 	// DefaultTTL is the default time-to-live value (or hop limit, in ipv6)
 	// for this endpoint.
 	DefaultTTL() uint8
@@ -270,10 +573,6 @@ type NetworkEndpoint interface {
 	// generally calculated as the MTU of the underlying data link endpoint
 	// minus the network endpoint max header length.
 	MTU() uint32
-
-	// Capabilities returns the set of capabilities supported by the
-	// underlying link-layer endpoint.
-	Capabilities() LinkEndpointCapabilities
 
 	// MaxHeaderLength returns the maximum size the network (and lower
 	// level layers combined) headers can have. Higher levels use this
@@ -295,14 +594,11 @@ type NetworkEndpoint interface {
 	// header to the given destination address. It takes ownership of pkt.
 	WriteHeaderIncludedPacket(r *Route, pkt *PacketBuffer) *tcpip.Error
 
-	// NICID returns the id of the NIC this endpoint belongs to.
-	NICID() tcpip.NICID
-
 	// HandlePacket is called by the link layer when new packets arrive to
 	// this network endpoint. It sets pkt.NetworkHeader.
 	//
 	// HandlePacket takes ownership of pkt.
-	HandlePacket(r *Route, pkt *PacketBuffer)
+	HandlePacket(r NetworkPacketInfo, pkt *PacketBuffer)
 
 	// Close is called when the endpoint is reomved from a stack.
 	Close()
@@ -310,6 +606,17 @@ type NetworkEndpoint interface {
 	// NetworkProtocolNumber returns the tcpip.NetworkProtocolNumber for
 	// this endpoint.
 	NetworkProtocolNumber() tcpip.NetworkProtocolNumber
+}
+
+// ForwardingNetworkProtocol is a NetworkProtocol that may forward packets.
+type ForwardingNetworkProtocol interface {
+	NetworkProtocol
+
+	// Forwarding returns the forwarding configuration.
+	Forwarding() bool
+
+	// SetForwarding sets the forwarding configuration.
+	SetForwarding(bool)
 }
 
 // NetworkProtocol is the interface that needs to be implemented by network
@@ -331,7 +638,7 @@ type NetworkProtocol interface {
 	ParseAddresses(v buffer.View) (src, dst tcpip.Address)
 
 	// NewEndpoint creates a new endpoint of this protocol.
-	NewEndpoint(nicID tcpip.NICID, linkAddrCache LinkAddressCache, nud NUDHandler, dispatcher TransportDispatcher, sender LinkEndpoint, st *Stack) NetworkEndpoint
+	NewEndpoint(nic NetworkInterface, linkAddrCache LinkAddressCache, nud NUDHandler, dispatcher TransportDispatcher) NetworkEndpoint
 
 	// SetOption allows enabling/disabling protocol specific features.
 	// SetOption returns an error if the option is not supported or the
@@ -442,7 +749,7 @@ type LinkEndpoint interface {
 	// To participate in transparent bridging, a LinkEndpoint implementation
 	// should call eth.Encode with header.EthernetFields.SrcAddr set to
 	// r.LocalLinkAddress if it is provided.
-	WritePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error
+	WritePacket(r NetworkPacketInfo, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error
 
 	// WritePackets writes packets with the given protocol through the
 	// given route. pkts must not be zero length. It takes ownership of pkts and
@@ -451,7 +758,7 @@ type LinkEndpoint interface {
 	// Right now, WritePackets is used only when the software segmentation
 	// offload is enabled. If it will be used for something else, it may
 	// require to change syscall filters.
-	WritePackets(r *Route, gso *GSO, pkts PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error)
+	WritePackets(r NetworkPacketInfo, gso *GSO, pkts PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error)
 
 	// WriteRawPacket writes a packet directly to the link. The packet
 	// should already have an ethernet header. It takes ownership of vv.
@@ -460,8 +767,8 @@ type LinkEndpoint interface {
 	// Attach attaches the data link layer endpoint to the network-layer
 	// dispatcher of the stack.
 	//
-	// Attach will be called with a nil dispatcher if the receiver's associated
-	// NIC is being removed.
+	// Attach is called with a nil dispatcher when the endpoint's NIC is being
+	// removed.
 	Attach(dispatcher NetworkDispatcher)
 
 	// IsAttached returns whether a NetworkDispatcher is attached to the

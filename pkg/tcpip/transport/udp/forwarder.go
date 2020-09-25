@@ -43,12 +43,12 @@ func NewForwarder(s *stack.Stack, handler func(*ForwarderRequest)) *Forwarder {
 //
 // This function is expected to be passed as an argument to the
 // stack.SetTransportProtocolHandler function.
-func (f *Forwarder) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+func (f *Forwarder) HandlePacket(r stack.NetworkPacketInfo, id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
 	f.handler(&ForwarderRequest{
-		stack: f.stack,
-		route: r,
-		id:    id,
-		pkt:   pkt,
+		stack:   f.stack,
+		pktInfo: r,
+		id:      id,
+		pkt:     pkt,
 	})
 
 	return true
@@ -58,10 +58,10 @@ func (f *Forwarder) HandlePacket(r *stack.Route, id stack.TransportEndpointID, p
 // passed to the client. Clients may optionally create an endpoint to represent
 // it via CreateEndpoint.
 type ForwarderRequest struct {
-	stack *stack.Stack
-	route *stack.Route
-	id    stack.TransportEndpointID
-	pkt   *stack.PacketBuffer
+	stack   *stack.Stack
+	pktInfo stack.NetworkPacketInfo
+	id      stack.TransportEndpointID
+	pkt     *stack.PacketBuffer
 }
 
 // ID returns the 4-tuple (src address, src port, dst address, dst port) that
@@ -72,16 +72,23 @@ func (r *ForwarderRequest) ID() stack.TransportEndpointID {
 
 // CreateEndpoint creates a connected UDP endpoint for the session request.
 func (r *ForwarderRequest) CreateEndpoint(queue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
-	ep := newEndpoint(r.stack, r.route.NetProto, queue)
-	if err := r.stack.RegisterTransportEndpoint(r.route.NICID(), []tcpip.NetworkProtocolNumber{r.route.NetProto}, ProtocolNumber, r.id, ep, ep.portFlags, ep.bindToDevice); err != nil {
+	// TODO: this is a workaround
+	route, err := r.stack.FindRoute(r.pktInfo.LinkPacketInfo.NICID, r.pktInfo.LocalAddress, r.pktInfo.RemoteAddress, r.pktInfo.LinkPacketInfo.NetProto, false /* multicastLoop */)
+	if err != nil {
+		return nil, err
+	}
+
+	ep := newEndpoint(r.stack, r.pktInfo.LinkPacketInfo.NetProto, queue)
+	if err := r.stack.RegisterTransportEndpoint(r.pktInfo.LinkPacketInfo.NICID, []tcpip.NetworkProtocolNumber{r.pktInfo.LinkPacketInfo.NetProto}, ProtocolNumber, r.id, ep, ep.portFlags, ep.bindToDevice); err != nil {
 		ep.Close()
+		route.Release()
 		return nil, err
 	}
 
 	ep.ID = r.id
-	ep.route = r.route.Clone()
+	ep.route = route
 	ep.dstPort = r.id.RemotePort
-	ep.RegisterNICID = r.route.NICID()
+	ep.RegisterNICID = r.pktInfo.LinkPacketInfo.NICID
 	ep.boundPortFlags = ep.portFlags
 
 	ep.state = StateConnected
@@ -90,7 +97,7 @@ func (r *ForwarderRequest) CreateEndpoint(queue *waiter.Queue) (tcpip.Endpoint, 
 	ep.rcvReady = true
 	ep.rcvMu.Unlock()
 
-	ep.HandlePacket(r.route, r.id, r.pkt)
+	ep.HandlePacket(r.pktInfo, r.id, r.pkt)
 
 	return ep, nil
 }

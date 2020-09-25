@@ -237,6 +237,14 @@ type Timer interface {
 // network node. Or, in the case of unix endpoints, it may represent a path.
 type Address string
 
+// WithPrefix returns the address with a prefix that represents a point subnet.
+func (a Address) WithPrefix() AddressWithPrefix {
+	return AddressWithPrefix{
+		Address:   a,
+		PrefixLen: len(a) * 8,
+	}
+}
+
 // AddressMask is a bitmask for an address.
 type AddressMask string
 
@@ -1614,9 +1622,6 @@ type UDPStats struct {
 
 	// ChecksumErrors is the number of datagrams dropped due to bad checksums.
 	ChecksumErrors *StatCounter
-
-	// InvalidSourceAddress is the number of invalid sourced datagrams dropped.
-	InvalidSourceAddress *StatCounter
 }
 
 // Stats holds statistics about the networking stack.

@@ -13,12 +13,7 @@
 // limitations under the License.
 
 // Package icmp contains the implementation of the ICMP and IPv6-ICMP transport
-// protocols for use in ping. To use it in the networking stack, this package
-// must be added to the project, and activated on the stack by passing
-// icmp.NewProtocol4() and/or icmp.NewProtocol6() as one of the transport
-// protocols when calling stack.New(). Then endpoints can be created by passing
-// icmp.ProtocolNumber or icmp.ProtocolNumber6 as the transport protocol number
-// when calling Stack.NewEndpoint().
+// protocols for use in ping.
 package icmp
 
 import (
@@ -42,6 +37,8 @@ const (
 
 // protocol implements stack.TransportProtocol.
 type protocol struct {
+	stack *stack.Stack
+
 	number tcpip.TransportProtocolNumber
 }
 
@@ -62,20 +59,20 @@ func (p *protocol) netProto() tcpip.NetworkProtocolNumber {
 
 // NewEndpoint creates a new icmp endpoint. It implements
 // stack.TransportProtocol.NewEndpoint.
-func (p *protocol) NewEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+func (p *protocol) NewEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
 	if netProto != p.netProto() {
 		return nil, tcpip.ErrUnknownProtocol
 	}
-	return newEndpoint(stack, netProto, p.number, waiterQueue)
+	return newEndpoint(p.stack, netProto, p.number, waiterQueue)
 }
 
 // NewRawEndpoint creates a new raw icmp endpoint. It implements
 // stack.TransportProtocol.NewRawEndpoint.
-func (p *protocol) NewRawEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+func (p *protocol) NewRawEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
 	if netProto != p.netProto() {
 		return nil, tcpip.ErrUnknownProtocol
 	}
-	return raw.NewEndpoint(stack, netProto, p.number, waiterQueue)
+	return raw.NewEndpoint(p.stack, netProto, p.number, waiterQueue)
 }
 
 // MinimumPacketSize returns the minimum valid icmp packet size.
@@ -104,7 +101,7 @@ func (p *protocol) ParsePorts(v buffer.View) (src, dst uint16, err *tcpip.Error)
 
 // HandleUnknownDestinationPacket handles packets targeted at this protocol but
 // that don't match any existing endpoint.
-func (*protocol) HandleUnknownDestinationPacket(*stack.Route, stack.TransportEndpointID, *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
+func (*protocol) HandleUnknownDestinationPacket(stack.NetworkPacketInfo, stack.TransportEndpointID, *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
 	return stack.UnknownDestinationPacketHandled
 }
 
@@ -135,11 +132,11 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) bool {
 }
 
 // NewProtocol4 returns an ICMPv4 transport protocol.
-func NewProtocol4() stack.TransportProtocol {
-	return &protocol{ProtocolNumber4}
+func NewProtocol4(s *stack.Stack) stack.TransportProtocol {
+	return &protocol{stack: s, number: ProtocolNumber4}
 }
 
 // NewProtocol6 returns an ICMPv6 transport protocol.
-func NewProtocol6() stack.TransportProtocol {
-	return &protocol{ProtocolNumber6}
+func NewProtocol6(s *stack.Stack) stack.TransportProtocol {
+	return &protocol{stack: s, number: ProtocolNumber6}
 }

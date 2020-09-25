@@ -183,8 +183,10 @@ func testWritePacket(t *testing.T, plen int, eth bool, gsoMaxSize uint32, hash u
 	c := newContext(t, &Options{Address: laddr, MTU: mtu, EthernetHeader: eth, GSOMaxSize: gsoMaxSize})
 	defer c.cleanup()
 
-	r := &stack.Route{
-		RemoteLinkAddress: raddr,
+	r := stack.NetworkPacketInfo{
+		LinkPacketInfo: stack.LinkPacketInfo{
+			RemoteLinkAddress: raddr,
+		},
 	}
 
 	// Build payload.
@@ -324,9 +326,11 @@ func TestPreserveSrcAddress(t *testing.T) {
 	defer c.cleanup()
 
 	// Set LocalLinkAddress in route to the value of the bridged address.
-	r := &stack.Route{
-		RemoteLinkAddress: raddr,
-		LocalLinkAddress:  baddr,
+	r := stack.NetworkPacketInfo{
+		LinkPacketInfo: stack.LinkPacketInfo{
+			RemoteLinkAddress: raddr,
+			LocalLinkAddress:  baddr,
+		},
 	}
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{

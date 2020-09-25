@@ -40,7 +40,7 @@ func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, pkt *stack
 	// Drop packet if it doesn't have the basic IPv4 header or if the
 	// original source address doesn't match an address we own.
 	src := hdr.SourceAddress()
-	if e.stack.CheckLocalAddress(e.NICID(), ProtocolNumber, src) == 0 {
+	if e.protocol.stack.CheckLocalAddress(e.nic.ID(), ProtocolNumber, src) == 0 {
 		return
 	}
 
@@ -58,8 +58,8 @@ func (e *endpoint) handleControl(typ stack.ControlType, extra uint32, pkt *stack
 	e.dispatcher.DeliverTransportControlPacket(src, hdr.DestinationAddress(), ProtocolNumber, p, typ, extra, pkt)
 }
 
-func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer) {
-	stats := r.Stats()
+func (e *endpoint) handleICMP(r stack.NetworkPacketInfo, pkt *stack.PacketBuffer) {
+	stats := e.protocol.stack.Stats()
 	received := stats.ICMP.V4PacketsReceived
 	// TODO(gvisor.dev/issue/170): ICMP packets don't have their
 	// TransportHeader fields set. See icmp/protocol.go:protocol.Parse for a
@@ -100,17 +100,17 @@ func (e *endpoint) handleICMP(r *stack.Route, pkt *stack.PacketBuffer) {
 		h.SetChecksum(wantChecksum)
 		e.dispatcher.DeliverTransportPacket(r, header.ICMPv4ProtocolNumber, pkt)
 
-		remoteLinkAddr := r.RemoteLinkAddress
+		remoteLinkAddr := r.LinkPacketInfo.RemoteLinkAddress
 
 		// As per RFC 1122 section 3.2.1.3, when a host sends any datagram, the IP
 		// source address MUST be one of its own IP addresses (but not a broadcast
 		// or multicast address).
 		localAddr := r.LocalAddress
-		if r.IsInboundBroadcast() || header.IsV4MulticastAddress(localAddr) {
+		if r.LocalAddressBroadcast || header.IsV4MulticastAddress(localAddr) {
 			localAddr = ""
 		}
 
-		r, err := r.Stack().FindRoute(e.NICID(), localAddr, r.RemoteAddress, ProtocolNumber, false /* multicastLoop */)
+		r, err := e.protocol.stack.FindRoute(e.nic.ID(), localAddr, r.RemoteAddress, ProtocolNumber, false /* multicastLoop */)
 		if err != nil {
 			// If we cannot find a route to the destination, silently drop the packet.
 			return
@@ -216,13 +216,7 @@ func (*icmpReasonPortUnreachable) isICMPReason() {}
 // the problematic packet. It incorporates as much of that packet as
 // possible as well as any error metadata as is available. returnError
 // expects pkt to hold a valid IPv4 packet as per the wire format.
-func returnError(r *stack.Route, reason icmpReason, pkt *stack.PacketBuffer) *tcpip.Error {
-	sent := r.Stats().ICMP.V4PacketsSent
-	if !r.Stack().AllowICMPMessage() {
-		sent.RateLimited.Increment()
-		return nil
-	}
-
+func (p *protocol) returnError(r stack.NetworkPacketInfo, reason icmpReason, pkt *stack.PacketBuffer) *tcpip.Error {
 	// We check we are responding only when we are allowed to.
 	// See RFC 1812 section 4.3.2.7 (shown below).
 	//
@@ -247,7 +241,18 @@ func returnError(r *stack.Route, reason icmpReason, pkt *stack.PacketBuffer) *tc
 	// TODO(gvisor.dev/issues/4058): Make sure we don't send ICMP errors in
 	// response to a non-initial fragment, but it currently can not happen.
 
-	if r.IsInboundBroadcast() || header.IsV4MulticastAddress(r.LocalAddress) || r.RemoteAddress == header.IPv4Any {
+	if r.LocalAddressBroadcast || header.IsV4MulticastAddress(r.LocalAddress) || r.RemoteAddress == header.IPv4Any {
+		return nil
+	}
+
+	route, err := p.stack.FindRoute(r.LinkPacketInfo.NICID, r.LocalAddress, r.RemoteAddress, ProtocolNumber, false /* multicastLoop */)
+	if err != nil {
+		return err
+	}
+
+	sent := p.stack.Stats().ICMP.V4PacketsSent
+	if !p.stack.AllowICMPMessage() {
+		sent.RateLimited.Increment()
 		return nil
 	}
 
@@ -303,11 +308,11 @@ func returnError(r *stack.Route, reason icmpReason, pkt *stack.PacketBuffer) *tc
 	// least 8 bytes of the payload must be included. Today linux and other
 	// systems implement the RFC 1812 definition and not the original
 	// requirement. We treat 8 bytes as the minimum but will try send more.
-	mtu := int(r.MTU())
+	mtu := int(route.MTU())
 	if mtu > header.IPv4MinimumProcessableDatagramSize {
 		mtu = header.IPv4MinimumProcessableDatagramSize
 	}
-	headerLen := int(r.MaxHeaderLength()) + header.ICMPv4MinimumSize
+	headerLen := int(route.MaxHeaderLength()) + header.ICMPv4MinimumSize
 	available := int(mtu) - headerLen
 
 	if available < header.IPv4MinimumSize+header.ICMPv4MinimumErrorPayloadSize {
@@ -344,11 +349,11 @@ func returnError(r *stack.Route, reason icmpReason, pkt *stack.PacketBuffer) *tc
 	counter := sent.DstUnreachable
 	icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, icmpPkt.Data))
 
-	if err := r.WritePacket(
+	if err := route.WritePacket(
 		nil, /* gso */
 		stack.NetworkHeaderParams{
 			Protocol: header.ICMPv4ProtocolNumber,
-			TTL:      r.DefaultTTL(),
+			TTL:      p.DefaultTTL(),
 			TOS:      stack.DefaultTOS,
 		},
 		icmpPkt,

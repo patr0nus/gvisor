@@ -294,8 +294,8 @@ type testContext struct {
 func newDualTestContext(t *testing.T, mtu uint32) *testContext {
 	t.Helper()
 	return newDualTestContextWithOptions(t, mtu, stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocol{ipv4.NewProtocol(), ipv6.NewProtocol()},
-		TransportProtocols: []stack.TransportProtocol{udp.NewProtocol()},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 	})
 }
 
@@ -532,8 +532,8 @@ func newMinPayload(minSize int) []byte {
 
 func TestBindToDeviceOption(t *testing.T) {
 	s := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocol{ipv4.NewProtocol()},
-		TransportProtocols: []stack.TransportProtocol{udp.NewProtocol()}})
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol}})
 
 	ep, err := s.NewEndpoint(udp.ProtocolNumber, ipv4.ProtocolNumber, &waiter.Queue{})
 	if err != nil {
@@ -807,8 +807,8 @@ func TestV4ReadSelfSource(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c := newDualTestContextWithOptions(t, defaultMTU, stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocol{ipv4.NewProtocol(), ipv6.NewProtocol()},
-				TransportProtocols: []stack.TransportProtocol{udp.NewProtocol()},
+				NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 				HandleLocal:        tt.handleLocal,
 			})
 			defer c.cleanup()
@@ -924,42 +924,6 @@ func TestReadFromMulticast(t *testing.T) {
 				t.Fatalf("Bind failed: %s", err)
 			}
 			testFailingRead(c, flow, false /* expectReadError */)
-		})
-	}
-}
-
-// TestReadFromMulticaststats checks that a discarded packet
-// that that was sent with multicast SOURCE address increments
-// the correct counters and that a regular packet does not.
-func TestReadFromMulticastStats(t *testing.T) {
-	t.Helper()
-	for _, flow := range []testFlow{reverseMulticast4, reverseMulticast6, unicastV4} {
-		t.Run(fmt.Sprintf("flow:%s", flow), func(t *testing.T) {
-			c := newDualTestContext(t, defaultMTU)
-			defer c.cleanup()
-
-			c.createEndpointForFlow(flow)
-
-			if err := c.ep.Bind(tcpip.FullAddress{Port: stackPort}); err != nil {
-				t.Fatalf("Bind failed: %s", err)
-			}
-
-			payload := newPayload()
-			c.injectPacket(flow, payload, false)
-
-			var want uint64 = 0
-			if flow.isReverseMulticast() {
-				want = 1
-			}
-			if got := c.s.Stats().IP.InvalidSourceAddressesReceived.Value(); got != want {
-				t.Errorf("got stats.IP.InvalidSourceAddressesReceived.Value() = %d, want = %d", got, want)
-			}
-			if got := c.s.Stats().UDP.InvalidSourceAddress.Value(); got != want {
-				t.Errorf("got stats.UDP.InvalidSourceAddress.Value() = %d, want = %d", got, want)
-			}
-			if got := c.ep.Stats().(*tcpip.TransportEndpointStats).ReceiveErrors.MalformedPacketsReceived.Value(); got != want {
-				t.Errorf("got EP Stats.ReceiveErrors.MalformedPacketsReceived stats = %d, want = %d", got, want)
-			}
 		})
 	}
 }
@@ -1466,6 +1430,30 @@ func TestNoChecksum(t *testing.T) {
 	}
 }
 
+var _ stack.NetworkInterface = (*testInterface)(nil)
+
+type testInterface struct{}
+
+func (*testInterface) ID() tcpip.NICID {
+	return 0
+}
+
+func (*testInterface) IsLoopback() bool {
+	return false
+}
+
+func (*testInterface) Name() string {
+	return ""
+}
+
+func (*testInterface) Enabled() bool {
+	return true
+}
+
+func (*testInterface) LinkEndpoint() stack.LinkEndpoint {
+	return nil
+}
+
 func TestTTL(t *testing.T) {
 	for _, flow := range []testFlow{unicastV4, unicastV4in6, unicastV6, unicastV6Only, multicastV4, multicastV4in6, multicastV6, broadcast, broadcastIn6} {
 		t.Run(fmt.Sprintf("flow:%s", flow), func(t *testing.T) {
@@ -1485,14 +1473,11 @@ func TestTTL(t *testing.T) {
 			} else {
 				var p stack.NetworkProtocol
 				if flow.isV4() {
-					p = ipv4.NewProtocol()
+					p = ipv4.NewProtocol(nil)
 				} else {
-					p = ipv6.NewProtocol()
+					p = ipv6.NewProtocol(nil)
 				}
-				ep := p.NewEndpoint(0, nil, nil, nil, nil, stack.New(stack.Options{
-					NetworkProtocols:   []stack.NetworkProtocol{ipv4.NewProtocol(), ipv6.NewProtocol()},
-					TransportProtocols: []stack.TransportProtocol{udp.NewProtocol()},
-				}))
+				ep := p.NewEndpoint(&testInterface{}, nil, nil, nil)
 				wantTTL = ep.DefaultTTL()
 				ep.Close()
 			}
@@ -2345,9 +2330,8 @@ func TestOutgoingSubnetBroadcast(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			s := stack.New(stack.Options{
-				NetworkProtocols: []stack.NetworkProtocol{ipv4.NewProtocol(), ipv6.NewProtocol()},
-
-				TransportProtocols: []stack.TransportProtocol{udp.NewProtocol()},
+				NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 			})
 			e := channel.New(0, defaultMTU, "")
 			if err := s.CreateNIC(nicID1, e); err != nil {

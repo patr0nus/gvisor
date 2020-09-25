@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -45,6 +46,8 @@ const (
 // use the first three: destination address, source address, and transport
 // protocol. They're all one byte fields to simplify parsing.
 type fwdTestNetworkEndpoint struct {
+	AddressableEndpointState
+
 	nicID      tcpip.NICID
 	proto      *fwdTestNetworkProtocol
 	dispatcher TransportDispatcher
@@ -53,19 +56,25 @@ type fwdTestNetworkEndpoint struct {
 
 var _ NetworkEndpoint = (*fwdTestNetworkEndpoint)(nil)
 
-func (f *fwdTestNetworkEndpoint) MTU() uint32 {
-	return f.ep.MTU() - uint32(f.MaxHeaderLength())
+func (*fwdTestNetworkEndpoint) Enable() *tcpip.Error {
+	return nil
 }
 
-func (f *fwdTestNetworkEndpoint) NICID() tcpip.NICID {
-	return f.nicID
+func (*fwdTestNetworkEndpoint) Enabled() bool {
+	return true
+}
+
+func (*fwdTestNetworkEndpoint) Disable() {}
+
+func (f *fwdTestNetworkEndpoint) MTU() uint32 {
+	return f.ep.MTU() - uint32(f.MaxHeaderLength())
 }
 
 func (*fwdTestNetworkEndpoint) DefaultTTL() uint8 {
 	return 123
 }
 
-func (f *fwdTestNetworkEndpoint) HandlePacket(r *Route, pkt *PacketBuffer) {
+func (f *fwdTestNetworkEndpoint) HandlePacket(r NetworkPacketInfo, pkt *PacketBuffer) {
 	// Dispatch the packet to the transport protocol.
 	f.dispatcher.DeliverTransportPacket(r, tcpip.TransportProtocolNumber(pkt.NetworkHeader().View()[protocolNumberOffset]), pkt)
 }
@@ -76,10 +85,6 @@ func (f *fwdTestNetworkEndpoint) MaxHeaderLength() uint16 {
 
 func (f *fwdTestNetworkEndpoint) PseudoHeaderChecksum(protocol tcpip.TransportProtocolNumber, dstAddr tcpip.Address) uint16 {
 	return 0
-}
-
-func (f *fwdTestNetworkEndpoint) Capabilities() LinkEndpointCapabilities {
-	return f.ep.Capabilities()
 }
 
 func (f *fwdTestNetworkEndpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
@@ -94,7 +99,7 @@ func (f *fwdTestNetworkEndpoint) WritePacket(r *Route, gso *GSO, params NetworkH
 	b[srcAddrOffset] = r.LocalAddress[0]
 	b[protocolNumberOffset] = byte(params.Protocol)
 
-	return f.ep.WritePacket(r, gso, fwdTestNetNumber, pkt)
+	return f.ep.WritePacket(r.PacketInfo(), gso, fwdTestNetNumber, pkt)
 }
 
 // WritePackets implements LinkEndpoint.WritePackets.
@@ -106,7 +111,9 @@ func (*fwdTestNetworkEndpoint) WriteHeaderIncludedPacket(r *Route, pkt *PacketBu
 	return tcpip.ErrNotSupported
 }
 
-func (*fwdTestNetworkEndpoint) Close() {}
+func (f *fwdTestNetworkEndpoint) Close() {
+	f.AddressableEndpointState.Cleanup()
+}
 
 // fwdTestNetworkProtocol is a network-layer protocol that implements Address
 // resolution.
@@ -116,6 +123,11 @@ type fwdTestNetworkProtocol struct {
 	addrResolveDelay       time.Duration
 	onLinkAddressResolved  func(cache *linkAddrCache, neigh *neighborCache, addr tcpip.Address, _ tcpip.LinkAddress)
 	onResolveStaticAddress func(tcpip.Address) (tcpip.LinkAddress, bool)
+
+	mu struct {
+		sync.RWMutex
+		forwarding bool
+	}
 }
 
 var _ NetworkProtocol = (*fwdTestNetworkProtocol)(nil)
@@ -145,13 +157,15 @@ func (*fwdTestNetworkProtocol) Parse(pkt *PacketBuffer) (tcpip.TransportProtocol
 	return tcpip.TransportProtocolNumber(netHeader[protocolNumberOffset]), true, true
 }
 
-func (f *fwdTestNetworkProtocol) NewEndpoint(nicID tcpip.NICID, _ LinkAddressCache, _ NUDHandler, dispatcher TransportDispatcher, ep LinkEndpoint, _ *Stack) NetworkEndpoint {
-	return &fwdTestNetworkEndpoint{
-		nicID:      nicID,
+func (f *fwdTestNetworkProtocol) NewEndpoint(nic NetworkInterface, _ LinkAddressCache, _ NUDHandler, dispatcher TransportDispatcher) NetworkEndpoint {
+	e := &fwdTestNetworkEndpoint{
+		nicID:      nic.ID(),
 		proto:      f,
 		dispatcher: dispatcher,
-		ep:         ep,
+		ep:         nic.LinkEndpoint(),
 	}
+	e.AddressableEndpointState.Init(e)
+	return e
 }
 
 func (*fwdTestNetworkProtocol) SetOption(tcpip.SettableNetworkProtocolOption) *tcpip.Error {
@@ -184,6 +198,21 @@ func (f *fwdTestNetworkProtocol) ResolveStaticAddress(addr tcpip.Address) (tcpip
 
 func (*fwdTestNetworkProtocol) LinkAddressProtocol() tcpip.NetworkProtocolNumber {
 	return fwdTestNetNumber
+}
+
+// Forwarding implements stack.ForwardingNetworkProtocol.
+func (f *fwdTestNetworkProtocol) Forwarding() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.mu.forwarding
+
+}
+
+// SetForwarding implements stack.ForwardingNetworkProtocol.
+func (f *fwdTestNetworkProtocol) SetForwarding(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mu.forwarding = v
 }
 
 // fwdTestPacketInfo holds all the information about an outbound packet.
@@ -251,10 +280,10 @@ func (e *fwdTestLinkEndpoint) LinkAddress() tcpip.LinkAddress {
 	return e.linkAddr
 }
 
-func (e fwdTestLinkEndpoint) WritePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error {
+func (e fwdTestLinkEndpoint) WritePacket(r NetworkPacketInfo, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error {
 	p := fwdTestPacketInfo{
-		RemoteLinkAddress: r.RemoteLinkAddress,
-		LocalLinkAddress:  r.LocalLinkAddress,
+		RemoteLinkAddress: r.LinkPacketInfo.RemoteLinkAddress,
+		LocalLinkAddress:  r.LinkPacketInfo.LocalLinkAddress,
 		Pkt:               pkt,
 	}
 
@@ -267,7 +296,7 @@ func (e fwdTestLinkEndpoint) WritePacket(r *Route, gso *GSO, protocol tcpip.Netw
 }
 
 // WritePackets stores outbound packets into the channel.
-func (e *fwdTestLinkEndpoint) WritePackets(r *Route, gso *GSO, pkts PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+func (e *fwdTestLinkEndpoint) WritePackets(r NetworkPacketInfo, gso *GSO, pkts PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
 	n := 0
 	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
 		e.WritePacket(r, gso, protocol, pkt)
@@ -307,7 +336,7 @@ func (e *fwdTestLinkEndpoint) AddHeader(local, remote tcpip.LinkAddress, protoco
 func fwdTestNetFactory(t *testing.T, proto *fwdTestNetworkProtocol, useNeighborCache bool) (ep1, ep2 *fwdTestLinkEndpoint) {
 	// Create a stack with the network protocol and two NICs.
 	s := New(Options{
-		NetworkProtocols: []NetworkProtocol{proto},
+		NetworkProtocols: []NetworkProtocolFactory{func(*Stack) NetworkProtocol { return proto }},
 		UseNeighborCache: useNeighborCache,
 	})
 

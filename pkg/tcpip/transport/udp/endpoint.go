@@ -1373,10 +1373,10 @@ func (e *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 // On IPv4, UDP checksum is optional, and a zero value means the transmitter
 // omitted the checksum generation (RFC768).
 // On IPv6, UDP checksum is not optional (RFC2460 Section 8.1).
-func verifyChecksum(r *stack.Route, hdr header.UDP, pkt *stack.PacketBuffer) bool {
-	if r.Capabilities()&stack.CapabilityRXChecksumOffload == 0 &&
-		(hdr.Checksum() != 0 || r.NetProto == header.IPv6ProtocolNumber) {
-		xsum := r.PseudoHeaderChecksum(ProtocolNumber, hdr.Length())
+func verifyChecksum(r stack.NetworkPacketInfo, hdr header.UDP, pkt *stack.PacketBuffer) bool {
+	if r.LinkPacketInfo.InterfaceCapabilities&stack.CapabilityRXChecksumOffload == 0 &&
+		(hdr.Checksum() != 0 || r.LinkPacketInfo.NetProto == header.IPv6ProtocolNumber) {
+		xsum := header.PseudoHeaderChecksum(ProtocolNumber, r.LocalAddress, r.RemoteAddress, hdr.Length())
 		for _, v := range pkt.Data.Views() {
 			xsum = header.Checksum(v, xsum)
 		}
@@ -1387,21 +1387,12 @@ func verifyChecksum(r *stack.Route, hdr header.UDP, pkt *stack.PacketBuffer) boo
 
 // HandlePacket is called by the stack when new packets arrive to this transport
 // endpoint.
-func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
+func (e *endpoint) HandlePacket(r stack.NetworkPacketInfo, id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
 	// Get the header then trim it from the view.
 	hdr := header.UDP(pkt.TransportHeader().View())
 	if int(hdr.Length()) > pkt.Data.Size()+header.UDPMinimumSize {
 		// Malformed packet.
 		e.stack.Stats().UDP.MalformedPacketsReceived.Increment()
-		e.stats.ReceiveErrors.MalformedPacketsReceived.Increment()
-		return
-	}
-
-	// Never receive from a multicast address.
-	if header.IsV4MulticastAddress(id.RemoteAddress) ||
-		header.IsV6MulticastAddress(id.RemoteAddress) {
-		e.stack.Stats().UDP.InvalidSourceAddress.Increment()
-		e.stack.Stats().IP.InvalidSourceAddressesReceived.Increment()
 		e.stats.ReceiveErrors.MalformedPacketsReceived.Increment()
 		return
 	}
@@ -1437,7 +1428,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 	// Push new packet into receive list and increment the buffer size.
 	packet := &udpPacket{
 		senderAddress: tcpip.FullAddress{
-			NIC:  r.NICID(),
+			NIC:  r.LinkPacketInfo.NICID,
 			Addr: id.RemoteAddress,
 			Port: header.UDP(hdr).SourcePort(),
 		},
@@ -1447,7 +1438,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 	e.rcvBufSize += pkt.Data.Size()
 
 	// Save any useful information from the network header to the packet.
-	switch r.NetProto {
+	switch r.LinkPacketInfo.NetProto {
 	case header.IPv4ProtocolNumber:
 		packet.tos, _ = header.IPv4(pkt.NetworkHeader().View()).TOS()
 	case header.IPv6ProtocolNumber:
@@ -1459,7 +1450,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 	// used to respond to the incoming packet.
 	packet.packetInfo.LocalAddr = r.LocalAddress
 	packet.packetInfo.DestinationAddr = r.LocalAddress
-	packet.packetInfo.NIC = r.NICID()
+	packet.packetInfo.NIC = r.LinkPacketInfo.NICID
 	packet.timestamp = e.stack.Clock().NowNanoseconds()
 
 	e.rcvMu.Unlock()

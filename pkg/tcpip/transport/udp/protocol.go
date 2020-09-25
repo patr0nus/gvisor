@@ -12,12 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package udp contains the implementation of the UDP transport protocol. To use
-// it in the networking stack, this package must be added to the project, and
-// activated on the stack by passing udp.NewProtocol() as one of the
-// transport protocols when calling stack.New(). Then endpoints can be created
-// by passing udp.ProtocolNumber as the transport protocol number when calling
-// Stack.NewEndpoint().
+// Package udp contains the implementation of the UDP transport protocol.
 package udp
 
 import (
@@ -50,6 +45,7 @@ const (
 )
 
 type protocol struct {
+	stack *stack.Stack
 }
 
 // Number returns the udp protocol number.
@@ -58,14 +54,14 @@ func (*protocol) Number() tcpip.TransportProtocolNumber {
 }
 
 // NewEndpoint creates a new udp endpoint.
-func (*protocol) NewEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
-	return newEndpoint(stack, netProto, waiterQueue), nil
+func (p *protocol) NewEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+	return newEndpoint(p.stack, netProto, waiterQueue), nil
 }
 
 // NewRawEndpoint creates a new raw UDP endpoint. It implements
 // stack.TransportProtocol.NewRawEndpoint.
-func (p *protocol) NewRawEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
-	return raw.NewEndpoint(stack, netProto, header.UDPProtocolNumber, waiterQueue)
+func (p *protocol) NewRawEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+	return raw.NewEndpoint(p.stack, netProto, header.UDPProtocolNumber, waiterQueue)
 }
 
 // MinimumPacketSize returns the minimum valid udp packet size.
@@ -82,15 +78,15 @@ func (*protocol) ParsePorts(v buffer.View) (src, dst uint16, err *tcpip.Error) {
 
 // HandleUnknownDestinationPacket handles packets that are targeted at this
 // protocol but don't match any existing endpoint.
-func (p *protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
+func (p *protocol) HandleUnknownDestinationPacket(r stack.NetworkPacketInfo, id stack.TransportEndpointID, pkt *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
 	hdr := header.UDP(pkt.TransportHeader().View())
 	if int(hdr.Length()) > pkt.Data.Size()+header.UDPMinimumSize {
-		r.Stack().Stats().UDP.MalformedPacketsReceived.Increment()
+		p.stack.Stats().UDP.MalformedPacketsReceived.Increment()
 		return stack.UnknownDestinationPacketMalformed
 	}
 
 	if !verifyChecksum(r, hdr, pkt) {
-		r.Stack().Stats().UDP.ChecksumErrors.Increment()
+		p.stack.Stats().UDP.ChecksumErrors.Increment()
 		return stack.UnknownDestinationPacketMalformed
 	}
 
@@ -119,6 +115,6 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) bool {
 }
 
 // NewProtocol returns a UDP transport protocol.
-func NewProtocol() stack.TransportProtocol {
-	return &protocol{}
+func NewProtocol(s *stack.Stack) stack.TransportProtocol {
+	return &protocol{stack: s}
 }

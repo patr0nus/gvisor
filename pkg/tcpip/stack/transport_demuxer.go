@@ -152,10 +152,10 @@ func (epsByNIC *endpointsByNIC) transportEndpoints() []TransportEndpoint {
 
 // HandlePacket is called by the stack when new packets arrive to this transport
 // endpoint.
-func (epsByNIC *endpointsByNIC) handlePacket(r *Route, id TransportEndpointID, pkt *PacketBuffer) {
+func (epsByNIC *endpointsByNIC) handlePacket(r NetworkPacketInfo, id TransportEndpointID, pkt *PacketBuffer) {
 	epsByNIC.mu.RLock()
 
-	mpep, ok := epsByNIC.endpoints[r.ref.nic.ID()]
+	mpep, ok := epsByNIC.endpoints[r.LinkPacketInfo.NICID]
 	if !ok {
 		if mpep, ok = epsByNIC.endpoints[0]; !ok {
 			epsByNIC.mu.RUnlock() // Don't use defer for performance reasons.
@@ -262,7 +262,7 @@ type transportDemuxer struct {
 // the dispatcher to delivery packets to the QueuePacket method instead of
 // calling HandlePacket directly on the endpoint.
 type queuedTransportProtocol interface {
-	QueuePacket(r *Route, ep TransportEndpoint, id TransportEndpointID, pkt *PacketBuffer)
+	QueuePacket(r NetworkPacketInfo, ep TransportEndpoint, id TransportEndpointID, pkt *PacketBuffer)
 }
 
 func newTransportDemuxer(stack *Stack) *transportDemuxer {
@@ -377,7 +377,7 @@ func selectEndpoint(id TransportEndpointID, mpep *multiPortEndpoint, seed uint32
 	return mpep.endpoints[idx]
 }
 
-func (ep *multiPortEndpoint) handlePacketAll(r *Route, id TransportEndpointID, pkt *PacketBuffer) {
+func (ep *multiPortEndpoint) handlePacketAll(r NetworkPacketInfo, id TransportEndpointID, pkt *PacketBuffer) {
 	ep.mu.RLock()
 	queuedProtocol, mustQueue := ep.demux.queuedProtocols[protocolIDs{ep.netProto, ep.transProto}]
 	// HandlePacket takes ownership of pkt, so each endpoint needs
@@ -518,8 +518,8 @@ func (d *transportDemuxer) unregisterEndpoint(netProtos []tcpip.NetworkProtocolN
 // deliverPacket attempts to find one or more matching transport endpoints, and
 // then, if matches are found, delivers the packet to them. Returns true if
 // the packet no longer needs to be handled.
-func (d *transportDemuxer) deliverPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer, id TransportEndpointID) bool {
-	eps, ok := d.protocol[protocolIDs{r.NetProto, protocol}]
+func (d *transportDemuxer) deliverPacket(r NetworkPacketInfo, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer, id TransportEndpointID) bool {
+	eps, ok := d.protocol[protocolIDs{r.LinkPacketInfo.NetProto, protocol}]
 	if !ok {
 		return false
 	}
@@ -532,7 +532,6 @@ func (d *transportDemuxer) deliverPacket(r *Route, protocol tcpip.TransportProto
 		eps.mu.RUnlock()
 		// Fail if we didn't find at least one matching transport endpoint.
 		if len(destEPs) == 0 {
-			r.Stats().UDP.UnknownPortErrors.Increment()
 			return false
 		}
 		// handlePacket takes ownership of pkt, so each endpoint needs its own
@@ -544,12 +543,13 @@ func (d *transportDemuxer) deliverPacket(r *Route, protocol tcpip.TransportProto
 		return true
 	}
 
-	// If the packet is a TCP packet with a non-unicast source or destination
-	// address, then do nothing further and instruct the caller to do the same.
-	if protocol == header.TCPProtocolNumber && (!isInboundUnicast(r) || !isOutboundUnicast(r)) {
+	// If the packet is a TCP packet with a unspecified source or non-unicast
+	// destination address, then do nothing further and instruct the caller to do
+	// the same. The network layer handles address validation for specified source
+	// addresses.
+	if protocol == header.TCPProtocolNumber && (!isSpecified(r.LocalAddress) || !isSpecified(r.RemoteAddress) || isInboundMulticastOrBroadcast(r)) {
 		// TCP can only be used to communicate between a single source and a
 		// single destination; the addresses must be unicast.
-		r.Stats().TCP.InvalidSegmentsReceived.Increment()
 		return true
 	}
 
@@ -557,9 +557,6 @@ func (d *transportDemuxer) deliverPacket(r *Route, protocol tcpip.TransportProto
 	ep := eps.findEndpointLocked(id)
 	eps.mu.RUnlock()
 	if ep == nil {
-		if protocol == header.UDPProtocolNumber {
-			r.Stats().UDP.UnknownPortErrors.Increment()
-		}
 		return false
 	}
 	ep.handlePacket(r, id, pkt)
@@ -568,8 +565,8 @@ func (d *transportDemuxer) deliverPacket(r *Route, protocol tcpip.TransportProto
 
 // deliverRawPacket attempts to deliver the given packet and returns whether it
 // was delivered successfully.
-func (d *transportDemuxer) deliverRawPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) bool {
-	eps, ok := d.protocol[protocolIDs{r.NetProto, protocol}]
+func (d *transportDemuxer) deliverRawPacket(r NetworkPacketInfo, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer) bool {
+	eps, ok := d.protocol[protocolIDs{r.LinkPacketInfo.NetProto, protocol}]
 	if !ok {
 		return false
 	}
@@ -626,7 +623,7 @@ func (d *transportDemuxer) findTransportEndpoint(netProto tcpip.NetworkProtocolN
 	epsByNIC.mu.RLock()
 	eps.mu.RUnlock()
 
-	mpep, ok := epsByNIC.endpoints[r.ref.nic.ID()]
+	mpep, ok := epsByNIC.endpoints[r.nic.ID()]
 	if !ok {
 		if mpep, ok = epsByNIC.endpoints[0]; !ok {
 			epsByNIC.mu.RUnlock() // Don't use defer for performance reasons.
@@ -677,14 +674,10 @@ func (d *transportDemuxer) unregisterRawEndpoint(netProto tcpip.NetworkProtocolN
 	eps.mu.Unlock()
 }
 
-func isInboundMulticastOrBroadcast(r *Route) bool {
-	return r.IsInboundBroadcast() || header.IsV4MulticastAddress(r.LocalAddress) || header.IsV6MulticastAddress(r.LocalAddress)
+func isInboundMulticastOrBroadcast(r NetworkPacketInfo) bool {
+	return r.LocalAddressBroadcast || header.IsV4MulticastAddress(r.LocalAddress) || header.IsV6MulticastAddress(r.LocalAddress)
 }
 
-func isInboundUnicast(r *Route) bool {
-	return r.LocalAddress != header.IPv4Any && r.LocalAddress != header.IPv6Any && !isInboundMulticastOrBroadcast(r)
-}
-
-func isOutboundUnicast(r *Route) bool {
-	return r.RemoteAddress != header.IPv4Any && r.RemoteAddress != header.IPv6Any && !r.IsOutboundBroadcast() && !header.IsV4MulticastAddress(r.RemoteAddress) && !header.IsV6MulticastAddress(r.RemoteAddress)
+func isSpecified(addr tcpip.Address) bool {
+	return addr != header.IPv4Any && addr != header.IPv6Any
 }

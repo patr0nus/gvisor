@@ -12,12 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package tcp contains the implementation of the TCP transport protocol. To use
-// it in the networking stack, this package must be added to the project, and
-// activated on the stack by passing tcp.NewProtocol() as one of the
-// transport protocols when calling stack.New(). Then endpoints can be created
-// by passing tcp.ProtocolNumber as the transport protocol number when calling
-// Stack.NewEndpoint().
+// Package tcp contains the implementation of the TCP transport protocol.
 package tcp
 
 import (
@@ -138,6 +133,8 @@ func (s *synRcvdCounter) Threshold() uint64 {
 }
 
 type protocol struct {
+	stack *stack.Stack
+
 	mu                         sync.RWMutex
 	sackEnabled                bool
 	recovery                   tcpip.TCPRecovery
@@ -164,14 +161,14 @@ func (*protocol) Number() tcpip.TransportProtocolNumber {
 }
 
 // NewEndpoint creates a new tcp endpoint.
-func (p *protocol) NewEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
-	return newEndpoint(stack, netProto, waiterQueue), nil
+func (p *protocol) NewEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+	return newEndpoint(p.stack, netProto, waiterQueue), nil
 }
 
 // NewRawEndpoint creates a new raw TCP endpoint. Raw TCP sockets are currently
 // unsupported. It implements stack.TransportProtocol.NewRawEndpoint.
-func (p *protocol) NewRawEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
-	return raw.NewEndpoint(stack, netProto, header.TCPProtocolNumber, waiterQueue)
+func (p *protocol) NewRawEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+	return raw.NewEndpoint(p.stack, netProto, header.TCPProtocolNumber, waiterQueue)
 }
 
 // MinimumPacketSize returns the minimum valid tcp packet size.
@@ -190,7 +187,7 @@ func (*protocol) ParsePorts(v buffer.View) (src, dst uint16, err *tcpip.Error) {
 // to a specific processing queue. Each queue is serviced by its own processor
 // goroutine which is responsible for dequeuing and doing full TCP dispatch of
 // the packet.
-func (p *protocol) QueuePacket(r *stack.Route, ep stack.TransportEndpoint, id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
+func (p *protocol) QueuePacket(r stack.NetworkPacketInfo, ep stack.TransportEndpoint, id stack.TransportEndpointID, pkt *stack.PacketBuffer) {
 	p.dispatcher.queuePacket(r, ep, id, pkt)
 }
 
@@ -201,9 +198,14 @@ func (p *protocol) QueuePacket(r *stack.Route, ep stack.TransportEndpoint, id st
 // a reset is sent in response to any incoming segment except another reset. In
 // particular, SYNs addressed to a non-existent connection are rejected by this
 // means."
+func (p *protocol) HandleUnknownDestinationPacket(r stack.NetworkPacketInfo, id stack.TransportEndpointID, pkt *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
+	// TODO: This is a workaround
+	route, err := p.stack.FindRoute(r.LinkPacketInfo.NICID, r.LocalAddress, r.RemoteAddress, r.LinkPacketInfo.NetProto, false /* multicastLoop */)
+	if err != nil {
+		return stack.UnknownDestinationPacketHandled
+	}
 
-func (*protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
-	s := newSegment(r, id, pkt)
+	s := newSegment(route, id, pkt)
 	defer s.decRef()
 
 	if !s.parse() || !s.csumValid {
@@ -510,8 +512,9 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) bool {
 }
 
 // NewProtocol returns a TCP transport protocol.
-func NewProtocol() stack.TransportProtocol {
+func NewProtocol(s *stack.Stack) stack.TransportProtocol {
 	p := protocol{
+		stack: s,
 		sendBufferSize: tcpip.TCPSendBufferSizeRangeOption{
 			Min:     MinBufferSize,
 			Default: DefaultSendBufferSize,

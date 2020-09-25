@@ -9,6 +9,7 @@ go_test(
         "ip_test.go",
     ],
     deps = [
+        "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/buffer",
         "//pkg/tcpip/header",
@@ -17,6 +18,7 @@ go_test(
         "//pkg/tcpip/network/ipv4",
         "//pkg/tcpip/network/ipv6",
         "//pkg/tcpip/stack",
+        "//pkg/tcpip/transport/icmp",
         "//pkg/tcpip/transport/tcp",
         "//pkg/tcpip/transport/udp",
     ],
