@@ -190,101 +190,6 @@ func (e *endpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
 	return e.protocol.Number()
 }
 
-// writePacketFragments calls e.linkEP.WritePacket with each packet fragment to
-// write. It assumes that the IP header is already present in pkt.NetworkHeader.
-// pkt.TransportHeader may be set. mtu includes the IP header and options. This
-// does not support the DontFragment IP flag.
-func (e *endpoint) writePacketFragments(r *stack.Route, gso *stack.GSO, mtu int, pkt *stack.PacketBuffer) *tcpip.Error {
-	// This packet is too big, it needs to be fragmented.
-	ip := header.IPv4(pkt.NetworkHeader().View())
-	flags := ip.Flags()
-
-	// Update mtu to take into account the header, which will exist in all
-	// fragments anyway.
-	innerMTU := mtu - int(ip.HeaderLength())
-
-	// Round the MTU down to align to 8 bytes. Then calculate the number of
-	// fragments. Calculate fragment sizes as in RFC791.
-	innerMTU &^= 7
-	n := (int(ip.PayloadLength()) + innerMTU - 1) / innerMTU
-
-	outerMTU := innerMTU + int(ip.HeaderLength())
-	offset := ip.FragmentOffset()
-
-	// Keep the length reserved for link-layer, we need to create fragments with
-	// the same reserved length.
-	reservedForLink := pkt.AvailableHeaderBytes()
-
-	// Destroy the packet, pull all payloads out for fragmentation.
-	transHeader, data := pkt.TransportHeader().View(), pkt.Data
-
-	// Where possible, the first fragment that is sent has the same
-	// number of bytes reserved for header as the input packet. The link-layer
-	// endpoint may depend on this for looking at, eg, L4 headers.
-	transFitsFirst := len(transHeader) <= innerMTU
-
-	for i := 0; i < n; i++ {
-		reserve := reservedForLink + int(ip.HeaderLength())
-		if i == 0 && transFitsFirst {
-			// Reserve for transport header if it's going to be put in the first
-			// fragment.
-			reserve += len(transHeader)
-		}
-		fragPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			ReserveHeaderBytes: reserve,
-		})
-		fragPkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
-
-		// Copy data for the fragment.
-		avail := innerMTU
-
-		if n := len(transHeader); n > 0 {
-			if n > avail {
-				n = avail
-			}
-			if i == 0 && transFitsFirst {
-				copy(fragPkt.TransportHeader().Push(n), transHeader)
-			} else {
-				fragPkt.Data.AppendView(transHeader[:n:n])
-			}
-			transHeader = transHeader[n:]
-			avail -= n
-		}
-
-		if avail > 0 {
-			n := data.Size()
-			if n > avail {
-				n = avail
-			}
-			data.ReadToVV(&fragPkt.Data, n)
-			avail -= n
-		}
-
-		copied := uint16(innerMTU - avail)
-
-		// Set lengths in header and calculate checksum.
-		h := header.IPv4(fragPkt.NetworkHeader().Push(len(ip)))
-		copy(h, ip)
-		if i != n-1 {
-			h.SetTotalLength(uint16(outerMTU))
-			h.SetFlagsFragmentOffset(flags|header.IPv4FlagMoreFragments, offset)
-		} else {
-			h.SetTotalLength(uint16(h.HeaderLength()) + copied)
-			h.SetFlagsFragmentOffset(flags, offset)
-		}
-		h.SetChecksum(0)
-		h.SetChecksum(^h.CalculateChecksum())
-		offset += copied
-
-		// Send out the fragment.
-		if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, fragPkt); err != nil {
-			return err
-		}
-		r.Stats().IP.PacketsSent.Increment()
-	}
-	return nil
-}
-
 func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params stack.NetworkHeaderParams) {
 	ip := header.IPv4(pkt.NetworkHeader().Push(header.IPv4MinimumSize))
 	length := uint16(pkt.Size())
@@ -303,7 +208,35 @@ func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params s
 		DstAddr:     r.RemoteAddress,
 	})
 	ip.SetChecksum(^ip.CalculateChecksum())
-	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
+	pkt.NetworkProtocolNumber = ProtocolNumber
+}
+
+func (e *endpoint) packetMustBeFragmented(pkt *stack.PacketBuffer, gso *stack.GSO) bool {
+	return pkt.Size() > int(e.linkEP.MTU()) && (gso == nil || gso.Type == stack.GSONone)
+}
+
+// handleFragments fragments pkt and calls the handler function on each
+// fragment. It returns the number of fragments handled and the number of
+// fragments left to be processed. The IP header must already be present in the
+// original packet. The mtu is the maximum size of the packets.
+func (e *endpoint) handleFragments(r *stack.Route, gso *stack.GSO, mtu uint32, pkt *stack.PacketBuffer, handler func(*stack.PacketBuffer) *tcpip.Error) (int, int, *tcpip.Error) {
+	fragMTU := int(calculateFragmentInnerMTU(mtu, pkt))
+	networkHeader := header.IPv4(pkt.NetworkHeader().View())
+	pf := fragmentation.MakePacketFragmenter(pkt, fragMTU, pkt.AvailableHeaderBytes()+len(networkHeader))
+
+	var n int
+	for {
+		fragPkt, more := buildNextFragment(&pf, networkHeader)
+		if err := handler(fragPkt); err != nil {
+			return n, pf.RemainingFragmentCount() + 1, err
+		}
+		n++
+		if !more {
+			break
+		}
+	}
+
+	return n, 0, nil
 }
 
 // WritePacket writes a packet to the given destination address and protocol.
@@ -329,7 +262,7 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 	// short circuits broadcasts before they are sent out to other hosts.
 	if pkt.NatDone {
 		netHeader := header.IPv4(pkt.NetworkHeader().View())
-		ep, err := e.protocol.stack.FindNetworkEndpoint(header.IPv4ProtocolNumber, netHeader.DestinationAddress())
+		ep, err := e.protocol.stack.FindNetworkEndpoint(ProtocolNumber, netHeader.DestinationAddress())
 		if err == nil {
 			route := r.ReverseRoute(netHeader.SourceAddress(), netHeader.DestinationAddress())
 			ep.HandlePacket(&route, pkt)
@@ -345,10 +278,23 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 	if r.Loop&stack.PacketOut == 0 {
 		return nil
 	}
-	if pkt.Size() > int(e.linkEP.MTU()) && (gso == nil || gso.Type == stack.GSONone) {
-		return e.writePacketFragments(r, gso, int(e.linkEP.MTU()), pkt)
+	if e.packetMustBeFragmented(pkt, gso) {
+		sent, remain, err := e.handleFragments(r, gso, e.linkEP.MTU(), pkt, func(fragPkt *stack.PacketBuffer) *tcpip.Error {
+			// TODO(gvisor.dev/issue/3884): Evaluate whether we want to send each
+			// fragment one by one using WritePacket() (current strategy) or if we
+			// want to create a PacketBufferList from the fragments and feed it to
+			// WritePackets(). It'll be faster but cost more memory.
+			if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, fragPkt); err != nil {
+				return err
+			}
+			return nil
+		})
+		r.Stats().IP.PacketsSent.IncrementBy(uint64(sent))
+		r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(remain))
+		return err
 	}
 	if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, pkt); err != nil {
+		r.Stats().IP.OutgoingPacketErrors.Increment()
 		return err
 	}
 	r.Stats().IP.PacketsSent.Increment()
@@ -364,9 +310,25 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		return pkts.Len(), nil
 	}
 
-	for pkt := pkts.Front(); pkt != nil; {
+	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
 		e.addIPHeader(r, pkt, params)
-		pkt = pkt.Next()
+		if e.packetMustBeFragmented(pkt, gso) {
+			current := pkt
+			_, _, err := e.handleFragments(r, gso, e.linkEP.MTU(), pkt, func(fragPkt *stack.PacketBuffer) *tcpip.Error {
+				// Modify the packet list in place with the new fragments.
+				pkts.InsertAfter(current, fragPkt)
+				current = current.Next()
+				return nil
+			})
+			if err != nil {
+				r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(pkts.Len()))
+				return 0, err
+			}
+			// The fragmented packet can be released. The rest of the packets can be
+			// processed.
+			pkts.Remove(pkt)
+			pkt = current
+		}
 	}
 
 	nicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
@@ -379,6 +341,9 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		// faster WritePackets API directly.
 		n, err := e.linkEP.WritePackets(r, gso, pkts, ProtocolNumber)
 		r.Stats().IP.PacketsSent.IncrementBy(uint64(n))
+		if err != nil {
+			r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(pkts.Len() - n))
+		}
 		return n, err
 	}
 	r.Stats().IP.IPTablesOutputDropped.IncrementBy(uint64(len(dropped)))
@@ -392,7 +357,7 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		}
 		if _, ok := natPkts[pkt]; ok {
 			netHeader := header.IPv4(pkt.NetworkHeader().View())
-			if ep, err := e.protocol.stack.FindNetworkEndpoint(header.IPv4ProtocolNumber, netHeader.DestinationAddress()); err == nil {
+			if ep, err := e.protocol.stack.FindNetworkEndpoint(ProtocolNumber, netHeader.DestinationAddress()); err == nil {
 				src := netHeader.SourceAddress()
 				dst := netHeader.DestinationAddress()
 				route := r.ReverseRoute(src, dst)
@@ -403,6 +368,7 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		}
 		if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, pkt); err != nil {
 			r.Stats().IP.PacketsSent.IncrementBy(uint64(n))
+			r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(pkts.Len() - n - len(dropped)))
 			// Dropped packets aren't errors, so include them in
 			// the return value.
 			return n + len(dropped), err
@@ -461,9 +427,28 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 		return nil
 	}
 
-	r.Stats().IP.PacketsSent.Increment()
+	if e.packetMustBeFragmented(pkt, nil) {
+		sent, remain, err := e.handleFragments(r, nil, e.linkEP.MTU(), pkt, func(fragPkt *stack.PacketBuffer) *tcpip.Error {
+			// TODO(gvisor.dev/issue/3884): Evaluate whether we want to send each
+			// fragment one by one using WritePacket() (current strategy) or if we
+			// want to create a PacketBufferList from the fragments and feed it to
+			// WritePackets(). It'll be faster but cost more memory.
+			if err := e.linkEP.WritePacket(r, nil, ProtocolNumber, fragPkt); err != nil {
+				return err
+			}
+			return nil
+		})
+		r.Stats().IP.PacketsSent.IncrementBy(uint64(sent))
+		r.Stats().IP.OutgoingPacketErrors.IncrementBy(uint64(remain))
+		return err
+	}
 
-	return e.linkEP.WritePacket(r, nil /* gso */, ProtocolNumber, pkt)
+	if err := e.linkEP.WritePacket(r, nil /* gso */, ProtocolNumber, pkt); err != nil {
+		r.Stats().IP.OutgoingPacketErrors.Increment()
+		return err
+	}
+	r.Stats().IP.PacketsSent.Increment()
+	return nil
 }
 
 // HandlePacket is called by the link layer when new ipv4 packets arrive for
@@ -794,14 +779,36 @@ func calculateMTU(mtu uint32) uint32 {
 	return mtu - header.IPv4MinimumSize
 }
 
+// calculateFragmentInnerMTU calculates the maximum number of bytes of
+// fragmentable data a fragment can have, based on the link layer mtu and pkt's
+// network header size.
+func calculateFragmentInnerMTU(mtu uint32, pkt *stack.PacketBuffer) uint32 {
+	if mtu > MaxTotalSize {
+		mtu = MaxTotalSize
+	}
+	mtu -= uint32(pkt.NetworkHeader().View().Size())
+	// Round the MTU down to align to 8 bytes.
+	mtu &^= 7
+	return mtu
+}
+
+// addressToUint32 translates an IPv4 address into its little endian uint32
+// representation.
+//
+// This function does the same thing as binary.LittleEndian.Uint32 but operates
+// on a tcpip.Address (a string) without the need to convert it to a byte slice,
+// which would cause an allocation.
+func addressToUint32(addr tcpip.Address) uint32 {
+	_ = addr[3] // bounds check hint to compiler
+	return uint32(addr[0]) | uint32(addr[1])<<8 | uint32(addr[2])<<16 | uint32(addr[3])<<24
+}
+
 // hashRoute calculates a hash value for the given route. It uses the source &
-// destination address, the transport protocol number, and a random initial
-// value (generated once on initialization) to generate the hash.
+// destination address, the transport protocol number and a 32-bit number to
+// generate the hash.
 func hashRoute(r *stack.Route, protocol tcpip.TransportProtocolNumber, hashIV uint32) uint32 {
-	t := r.LocalAddress
-	a := uint32(t[0]) | uint32(t[1])<<8 | uint32(t[2])<<16 | uint32(t[3])<<24
-	t = r.RemoteAddress
-	b := uint32(t[0]) | uint32(t[1])<<8 | uint32(t[2])<<16 | uint32(t[3])<<24
+	a := addressToUint32(r.LocalAddress)
+	b := addressToUint32(r.RemoteAddress)
 	return hash.Hash3Words(a, b, uint32(protocol), hashIV)
 }
 
@@ -823,4 +830,27 @@ func NewProtocol(s *stack.Stack) stack.NetworkProtocol {
 		defaultTTL:    DefaultTTL,
 		fragmentation: fragmentation.NewFragmentation(fragmentblockSize, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout, s.Clock()),
 	}
+}
+
+func buildNextFragment(pf *fragmentation.PacketFragmenter, originalIPHeader header.IPv4) (*stack.PacketBuffer, bool) {
+	fragPkt, offset, copied, more := pf.BuildNextFragment()
+	fragPkt.NetworkProtocolNumber = ProtocolNumber
+
+	originalIPHeaderLength := len(originalIPHeader)
+	nextFragIPHeader := header.IPv4(fragPkt.NetworkHeader().Push(originalIPHeaderLength))
+
+	if copied := copy(nextFragIPHeader, originalIPHeader); copied != len(originalIPHeader) {
+		panic(fmt.Sprintf("wrong number of bytes copied into fragmentIPHeaders: got = %d, want = %d", copied, originalIPHeaderLength))
+	}
+
+	flags := originalIPHeader.Flags()
+	if more {
+		flags |= header.IPv4FlagMoreFragments
+	}
+	nextFragIPHeader.SetFlagsFragmentOffset(flags, offset)
+	nextFragIPHeader.SetTotalLength(uint16(nextFragIPHeader.HeaderLength()) + copied)
+	nextFragIPHeader.SetChecksum(0)
+	nextFragIPHeader.SetChecksum(^nextFragIPHeader.CalculateChecksum())
+
+	return fragPkt, more
 }

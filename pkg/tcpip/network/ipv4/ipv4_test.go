@@ -123,16 +123,6 @@ func compareFragments(t *testing.T, packets []*stack.PacketBuffer, sourcePacketI
 		if got, want := len(ip), int(mtu); got > want {
 			t.Errorf("fragment is too large, got %d want %d", got, want)
 		}
-		if i == 0 {
-			got := packet.NetworkHeader().View().Size() + packet.TransportHeader().View().Size()
-			// sourcePacketInfo does not have NetworkHeader added, simulate one.
-			want := header.IPv4MinimumSize + sourcePacketInfo.TransportHeader().View().Size()
-			// Check that it kept the transport header in packet.TransportHeader if
-			// it fits in the first fragment.
-			if want < int(mtu) && got != want {
-				t.Errorf("first fragment hdr parts should have unmodified length if possible: got %d, want %d", got, want)
-			}
-		}
 		if got, want := packet.AvailableHeaderBytes(), sourcePacketInfo.AvailableHeaderBytes()-header.IPv4MinimumSize; got != want {
 			t.Errorf("fragment #%d should have the same available space for prepending as source: got %d, want %d", i, got, want)
 		}
@@ -161,31 +151,114 @@ func compareFragments(t *testing.T, packets []*stack.PacketBuffer, sourcePacketI
 	}
 }
 
-func TestFragmentation(t *testing.T) {
+type fragmentationTestCase struct {
+	description              string
+	mtu                      uint32
+	gso                      *stack.GSO
+	transportHeaderLength    int
+	extraHeaderReserveLength int
+	payloadViewsSizes        []int
+	expectedFrags            int
+}
+
+func buildFragmentationTestCases() []fragmentationTestCase {
 	var manyPayloadViewsSizes [1000]int
 	for i := range manyPayloadViewsSizes {
 		manyPayloadViewsSizes[i] = 7
 	}
-	fragTests := []struct {
-		description              string
-		mtu                      uint32
-		gso                      *stack.GSO
-		transportHeaderLength    int
-		extraHeaderReserveLength int
-		payloadViewsSizes        []int
-		expectedFrags            int
-	}{
-		{"NoFragmentation", 2000, &stack.GSO{}, 0, header.IPv4MinimumSize, []int{1000}, 1},
-		{"NoFragmentationWithBigHeader", 2000, &stack.GSO{}, 16, header.IPv4MinimumSize, []int{1000}, 1},
-		{"Fragmented", 800, &stack.GSO{}, 0, header.IPv4MinimumSize, []int{1000}, 2},
-		{"FragmentedWithGsoNil", 800, nil, 0, header.IPv4MinimumSize, []int{1000}, 2},
-		{"FragmentedWithManyViews", 300, &stack.GSO{}, 0, header.IPv4MinimumSize, manyPayloadViewsSizes[:], 25},
-		{"FragmentedWithManyViewsAndPrependableBytes", 300, &stack.GSO{}, 0, header.IPv4MinimumSize + 55, manyPayloadViewsSizes[:], 25},
-		{"FragmentedWithBigHeader", 800, &stack.GSO{}, 20, header.IPv4MinimumSize, []int{1000}, 2},
-		{"FragmentedWithBigHeaderAndPrependableBytes", 800, &stack.GSO{}, 20, header.IPv4MinimumSize + 66, []int{1000}, 2},
-		{"FragmentedWithMTUSmallerThanHeaderAndPrependableBytes", 300, &stack.GSO{}, 1000, header.IPv4MinimumSize + 77, []int{500}, 6},
+	return []fragmentationTestCase{
+		{
+			description:              "No fragmentation",
+			mtu:                      2000,
+			gso:                      &stack.GSO{},
+			transportHeaderLength:    0,
+			extraHeaderReserveLength: header.IPv4MinimumSize,
+			payloadViewsSizes:        []int{1000},
+			expectedFrags:            1,
+		},
+		{
+			description:              "No fragmentation with big header",
+			mtu:                      2000,
+			gso:                      &stack.GSO{},
+			transportHeaderLength:    16,
+			extraHeaderReserveLength: header.IPv4MinimumSize,
+			payloadViewsSizes:        []int{1000},
+			expectedFrags:            1,
+		},
+		{
+			description:              "Fragmented",
+			mtu:                      800,
+			gso:                      &stack.GSO{},
+			transportHeaderLength:    0,
+			extraHeaderReserveLength: header.IPv4MinimumSize,
+			payloadViewsSizes:        []int{1000},
+			expectedFrags:            2,
+		},
+		{
+			description:              "Fragmented with gso nil",
+			mtu:                      800,
+			gso:                      nil,
+			transportHeaderLength:    0,
+			extraHeaderReserveLength: header.IPv4MinimumSize,
+			payloadViewsSizes:        []int{1000},
+			expectedFrags:            2,
+		},
+		{
+			description:              "Fragmented with many views",
+			mtu:                      300,
+			gso:                      &stack.GSO{},
+			transportHeaderLength:    0,
+			extraHeaderReserveLength: header.IPv4MinimumSize,
+			payloadViewsSizes:        manyPayloadViewsSizes[:],
+			expectedFrags:            25,
+		},
+		{
+			description:              "Fragmented with many views and prependable bytes",
+			mtu:                      300,
+			gso:                      &stack.GSO{},
+			transportHeaderLength:    0,
+			extraHeaderReserveLength: header.IPv4MinimumSize + 55,
+			payloadViewsSizes:        manyPayloadViewsSizes[:],
+			expectedFrags:            25,
+		},
+		{
+			description:              "Fragmented with big header",
+			mtu:                      800,
+			gso:                      &stack.GSO{},
+			transportHeaderLength:    20,
+			extraHeaderReserveLength: header.IPv4MinimumSize,
+			payloadViewsSizes:        []int{1000},
+			expectedFrags:            2,
+		},
+		{
+			description:              "Fragmented with big header and prependable bytes",
+			mtu:                      800,
+			gso:                      &stack.GSO{},
+			transportHeaderLength:    20,
+			extraHeaderReserveLength: header.IPv4MinimumSize + 66,
+			payloadViewsSizes:        []int{1000},
+			expectedFrags:            2,
+		},
+		{
+			description:              "Fragmented with MTU smaller than header and prependable bytes",
+			mtu:                      300,
+			gso:                      &stack.GSO{},
+			transportHeaderLength:    1000,
+			extraHeaderReserveLength: header.IPv4MinimumSize + 77,
+			payloadViewsSizes:        []int{500},
+			expectedFrags:            6,
+		},
 	}
+}
 
+func TestFragmentation(t *testing.T) {
+	const ttl = 42
+
+	var manyPayloadViewsSizes [1000]int
+	for i := range manyPayloadViewsSizes {
+		manyPayloadViewsSizes[i] = 7
+	}
+	fragTests := buildFragmentationTestCases()
 	for _, ft := range fragTests {
 		t.Run(ft.description, func(t *testing.T) {
 			ep := testutil.NewMockLinkEndpoint(ft.mtu, nil, math.MaxInt32)
@@ -194,11 +267,11 @@ func TestFragmentation(t *testing.T) {
 			source := pkt.Clone()
 			err := r.WritePacket(ft.gso, stack.NetworkHeaderParams{
 				Protocol: tcp.ProtocolNumber,
-				TTL:      42,
+				TTL:      ttl,
 				TOS:      stack.DefaultTOS,
 			}, pkt)
 			if err != nil {
-				t.Errorf("got err = %s, want = nil", err)
+				t.Fatalf("r.WritePacket(_, _, _) = %s", err)
 			}
 
 			if got := len(ep.WrittenPackets); got != ft.expectedFrags {
@@ -207,7 +280,98 @@ func TestFragmentation(t *testing.T) {
 			if got, want := len(ep.WrittenPackets), int(r.Stats().IP.PacketsSent.Value()); got != want {
 				t.Errorf("no errors yet got len(ep.WrittenPackets) = %d, want = %d", got, want)
 			}
+			if got := r.Stats().IP.OutgoingPacketErrors.Value(); got != 0 {
+				t.Errorf("got r.Stats().IP.OutgoingPacketErrors.Value() = %d, want = 0", got)
+			}
 			compareFragments(t, ep.WrittenPackets, source, ft.mtu)
+		})
+	}
+}
+
+func TestFragmentationWritePackets(t *testing.T) {
+	const ttl = 42
+	writePacketsTests := []struct {
+		description  string
+		insertBefore int
+		insertAfter  int
+	}{
+		{
+			description:  "Single packet",
+			insertBefore: 0,
+			insertAfter:  0,
+		},
+		{
+			description:  "With packet before",
+			insertBefore: 1,
+			insertAfter:  0,
+		},
+		{
+			description:  "With packet after",
+			insertBefore: 0,
+			insertAfter:  1,
+		},
+		{
+			description:  "With packet before and after",
+			insertBefore: 1,
+			insertAfter:  1,
+		},
+	}
+	tinyPacket := testutil.MakeRandPkt(header.TCPMinimumSize, header.IPv4MinimumSize, []int{1}, header.IPv4ProtocolNumber)
+
+	fragTests := buildFragmentationTestCases()
+	for _, writePacketsTest := range writePacketsTests {
+		t.Run(writePacketsTest.description, func(t *testing.T) {
+			for _, ft := range fragTests {
+				t.Run(ft.description, func(t *testing.T) {
+					var pkts stack.PacketBufferList
+					for i := 0; i < writePacketsTest.insertBefore; i++ {
+						pkts.PushBack(tinyPacket.Clone())
+					}
+					pkt := testutil.MakeRandPkt(ft.transportHeaderLength, ft.extraHeaderReserveLength, ft.payloadViewsSizes, header.IPv4ProtocolNumber)
+					source := pkt
+					pkts.PushBack(pkt.Clone())
+					for i := 0; i < writePacketsTest.insertAfter; i++ {
+						pkts.PushBack(tinyPacket.Clone())
+					}
+
+					ep := testutil.NewMockLinkEndpoint(ft.mtu, nil, math.MaxInt32)
+					r := buildRoute(t, ep)
+
+					wantTotalPackets := ft.expectedFrags + writePacketsTest.insertBefore + writePacketsTest.insertAfter
+					n, err := r.WritePackets(ft.gso, pkts, stack.NetworkHeaderParams{
+						Protocol: tcp.ProtocolNumber,
+						TTL:      ttl,
+						TOS:      stack.DefaultTOS,
+					})
+					if n != wantTotalPackets {
+						t.Errorf("got WritePackets() = %d, %s, want = %d, nil", n, err, wantTotalPackets)
+					}
+					if got := len(ep.WrittenPackets); got != wantTotalPackets {
+						t.Errorf("got len(ep.WrittenPackets) = %d, want = %d", got, wantTotalPackets)
+					}
+					if got := int(r.Stats().IP.PacketsSent.Value()); got != wantTotalPackets {
+						t.Errorf("got c.Route.Stats().IP.PacketsSent.Value() = %d, want = %d", got, wantTotalPackets)
+					}
+					if got := int(r.Stats().IP.OutgoingPacketErrors.Value()); got != 0 {
+						t.Errorf("got r.Stats().IP.OutgoingPacketErrors.Value() = %d, want = 0", got)
+					}
+
+					if wantTotalPackets == 0 {
+						return
+					}
+
+					for i := 0; i < writePacketsTest.insertBefore; i++ {
+						compareFragments(t, ep.WrittenPackets[:1], tinyPacket.Clone(), ft.mtu)
+						ep.WrittenPackets = ep.WrittenPackets[1:]
+					}
+					compareFragments(t, ep.WrittenPackets[:ft.expectedFrags], source, ft.mtu)
+					ep.WrittenPackets = ep.WrittenPackets[ft.expectedFrags:]
+					for i := 0; i < writePacketsTest.insertAfter; i++ {
+						compareFragments(t, ep.WrittenPackets[:1], tinyPacket.Clone(), ft.mtu)
+						ep.WrittenPackets = ep.WrittenPackets[1:]
+					}
+				})
+			}
 		})
 	}
 }
@@ -215,35 +379,69 @@ func TestFragmentation(t *testing.T) {
 // TestFragmentationErrors checks that errors are returned from write packet
 // correctly.
 func TestFragmentationErrors(t *testing.T) {
+	const ttl = 42
+
+	expectedError := tcpip.ErrAborted
 	fragTests := []struct {
 		description           string
 		mtu                   uint32
 		transportHeaderLength int
-		payloadViewsSizes     []int
-		err                   *tcpip.Error
+		payloadSize           int
 		allowPackets          int
+		fragmentCount         int
 	}{
-		{"NoFrag", 2000, 0, []int{1000}, tcpip.ErrAborted, 0},
-		{"ErrorOnFirstFrag", 500, 0, []int{1000}, tcpip.ErrAborted, 0},
-		{"ErrorOnSecondFrag", 500, 0, []int{1000}, tcpip.ErrAborted, 1},
-		{"ErrorOnFirstFragMTUSmallerThanHeader", 500, 1000, []int{500}, tcpip.ErrAborted, 0},
+		{
+			description:           "No frag",
+			mtu:                   2000,
+			transportHeaderLength: 0,
+			payloadSize:           1000,
+			allowPackets:          0,
+			fragmentCount:         1,
+		},
+		{
+			description:           "Error on first frag",
+			mtu:                   500,
+			transportHeaderLength: 0,
+			payloadSize:           1000,
+			allowPackets:          0,
+			fragmentCount:         3,
+		},
+		{
+			description:           "Error on second frag",
+			mtu:                   500,
+			transportHeaderLength: 0,
+			payloadSize:           1000,
+			allowPackets:          1,
+			fragmentCount:         3,
+		},
+		{
+			description:           "Error on first frag MTU smaller than header",
+			mtu:                   500,
+			transportHeaderLength: 1000,
+			payloadSize:           500,
+			allowPackets:          0,
+			fragmentCount:         4,
+		},
 	}
 
 	for _, ft := range fragTests {
 		t.Run(ft.description, func(t *testing.T) {
-			ep := testutil.NewMockLinkEndpoint(ft.mtu, ft.err, ft.allowPackets)
+			ep := testutil.NewMockLinkEndpoint(ft.mtu, expectedError, ft.allowPackets)
 			r := buildRoute(t, ep)
-			pkt := testutil.MakeRandPkt(ft.transportHeaderLength, header.IPv4MinimumSize, ft.payloadViewsSizes, header.IPv4ProtocolNumber)
+			pkt := testutil.MakeRandPkt(ft.transportHeaderLength, header.IPv4MinimumSize, []int{ft.payloadSize}, header.IPv4ProtocolNumber)
 			err := r.WritePacket(&stack.GSO{}, stack.NetworkHeaderParams{
 				Protocol: tcp.ProtocolNumber,
-				TTL:      42,
+				TTL:      ttl,
 				TOS:      stack.DefaultTOS,
 			}, pkt)
-			if err != ft.err {
-				t.Errorf("got WritePacket() = %s, want = %s", err, ft.err)
+			if err != expectedError {
+				t.Errorf("got WritePacket() = %s, want = %s", err, expectedError)
 			}
 			if got, want := len(ep.WrittenPackets), int(r.Stats().IP.PacketsSent.Value()); err != nil && got != want {
 				t.Errorf("got len(ep.WrittenPackets) = %d, want = %d", got, want)
+			}
+			if got, want := int(r.Stats().IP.OutgoingPacketErrors.Value()), ft.fragmentCount-ft.allowPackets; got != want {
+				t.Errorf("got r.Stats().IP.OutgoingPacketErrors.Value() = %d, want = %d", got, want)
 			}
 		})
 	}
@@ -1005,6 +1203,7 @@ func TestReceiveFragments(t *testing.T) {
 
 func TestWriteStats(t *testing.T) {
 	const nPackets = 3
+
 	tests := []struct {
 		name          string
 		setup         func(*testing.T, *stack.Stack)
@@ -1150,12 +1349,13 @@ func buildRoute(t *testing.T, ep stack.LinkEndpoint) stack.Route {
 		dst = "\x10\x00\x00\x02"
 	)
 	if err := s.AddAddress(1, ipv4.ProtocolNumber, src); err != nil {
-		t.Fatalf("AddAddress(1, %d, _) failed: %s", ipv4.ProtocolNumber, err)
+		t.Fatalf("AddAddress(1, %d, %s) failed: %s", ipv4.ProtocolNumber, src, err)
 	}
 	{
-		subnet, err := tcpip.NewSubnet(dst, tcpip.AddressMask(header.IPv4Broadcast))
+		mask := tcpip.AddressMask(header.IPv4Broadcast)
+		subnet, err := tcpip.NewSubnet(dst, mask)
 		if err != nil {
-			t.Fatalf("NewSubnet(_, _) failed: %v", err)
+			t.Fatalf("NewSubnet(%s, %s) failed: %v", dst, mask, err)
 		}
 		s.SetRouteTable([]tcpip.Route{{
 			Destination: subnet,
@@ -1164,7 +1364,7 @@ func buildRoute(t *testing.T, ep stack.LinkEndpoint) stack.Route {
 	}
 	rt, err := s.FindRoute(1, src, dst, ipv4.ProtocolNumber, false /* multicastLoop */)
 	if err != nil {
-		t.Fatalf("got FindRoute(1, _, _, %d, false) = %s, want = nil", ipv4.ProtocolNumber, err)
+		t.Fatalf("FindRoute(1, %s, %s, %d, false) = %s", src, dst, ipv4.ProtocolNumber, err)
 	}
 	return rt
 }

@@ -20,8 +20,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
+	"gvisor.dev/gvisor/pkg/tcpip/network/testutil"
 )
 
 // vv is a helper to build VectorisedView from different strings.
@@ -377,6 +379,103 @@ func TestErrors(t *testing.T) {
 			}
 			if done {
 				t.Errorf("got Process(_, %d, %d, %t, _, %q) = (_, _, true, _), want = (_, _, false, _)", test.first, test.last, test.more, test.data)
+			}
+		})
+	}
+}
+
+func TestPacketFragmenter(t *testing.T) {
+	const (
+		reserve = 60
+		proto   = 0
+	)
+
+	tests := []struct {
+		name                  string
+		innerMTU              int
+		transportHeaderLen    int
+		payloadSize           int
+		expectedFragmentCount int
+	}{
+		{
+			name:                  "Packet exactly fits in MTU",
+			innerMTU:              1280,
+			transportHeaderLen:    0,
+			payloadSize:           1280,
+			expectedFragmentCount: 1,
+		},
+		{
+			name:                  "Packet exactly does not fit in MTU",
+			innerMTU:              1000,
+			transportHeaderLen:    0,
+			payloadSize:           1001,
+			expectedFragmentCount: 2,
+		},
+		{
+			name:                  "Packet has a transport header",
+			innerMTU:              560,
+			transportHeaderLen:    40,
+			payloadSize:           560,
+			expectedFragmentCount: 2,
+		},
+		{
+			name:                  "Packet has a huge transport header",
+			innerMTU:              500,
+			transportHeaderLen:    1300,
+			payloadSize:           500,
+			expectedFragmentCount: 4,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pkt := testutil.MakeRandPkt(test.transportHeaderLen, reserve, []int{test.payloadSize}, proto)
+			var originalPayload buffer.VectorisedView
+			originalPayload.AppendView(pkt.TransportHeader().View())
+			originalPayload.Append(pkt.Data)
+			var reassembledPayload buffer.VectorisedView
+			var currentFragment int
+			bytesLeft := uint16(pkt.TransportHeader().View().Size() + pkt.Data.Size())
+			pf := MakePacketFragmenter(pkt, test.innerMTU, reserve)
+			for {
+				if got, want := pf.RemainingFragmentCount(), test.expectedFragmentCount-currentFragment; got != want {
+					t.Errorf("(fragment #%d) got pf.RemainingFragmentCount() = %d, want = %d", currentFragment, got, want)
+				}
+				fragPkt, offset, copied, more := pf.BuildNextFragment()
+				expectedCopied := uint16(test.innerMTU)
+				if currentFragment == test.expectedFragmentCount-1 {
+					expectedCopied = bytesLeft
+				}
+				bytesLeft -= expectedCopied
+				if copied != expectedCopied {
+					t.Errorf("(fragment #%d) got copied = %d, want = %d", currentFragment, copied, expectedCopied)
+				}
+				if want := uint16(currentFragment * test.innerMTU); offset != want {
+					t.Errorf("(fragment #%d) got offset = %d, want = %d", currentFragment, offset, want)
+				}
+				if want := currentFragment != test.expectedFragmentCount-1; more != want {
+					t.Errorf("(fragment #%d) got more = %t, want = %t", currentFragment, more, want)
+				}
+				if got := fragPkt.Size(); got > test.innerMTU {
+					t.Errorf("(fragment #%d) got fragPkt.Size() = %d, want <= %d", currentFragment, got, test.innerMTU)
+				}
+				if got := fragPkt.AvailableHeaderBytes(); got != reserve {
+					t.Errorf("(fragment #%d) got fragPkt.AvailableHeaderBytes() = %d, want = %d", currentFragment, got, reserve)
+				}
+				if got := fragPkt.TransportHeader().View().Size(); got != 0 {
+					t.Errorf("(fragment #%d) got fragPkt.TransportHeader().View().Size() = %d, want = 0", currentFragment, got)
+				}
+				reassembledPayload.Append(fragPkt.Data)
+				currentFragment++
+				if !more {
+					break
+				}
+			}
+			if currentFragment != test.expectedFragmentCount {
+				t.Errorf("got currentFragment = %d, want = %d", currentFragment, test.expectedFragmentCount)
+			}
+			if diff := cmp.Diff(reassembledPayload.ToView(), originalPayload.ToView()); diff != "" {
+				t.Errorf("reassembledPayload mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
