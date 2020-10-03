@@ -35,6 +35,9 @@ DOCKER_SOCKET := /var/run/docker.sock
 DOCKER_CONFIG := /etc/docker/daemon.json
 
 # Bazel flags.
+ifneq (,$(BAZEL_INVOCATION_ID))
+STARTUP_OPTIONS += --invocation_id="$(BAZEL_INVOCATION_ID)"
+endif
 BAZEL := bazel $(STARTUP_OPTIONS)
 OPTIONS += --color=no --curses=no
 

@@ -19,7 +19,8 @@ import (
 
 	shim "github.com/containerd/containerd/runtime/v1/shim/v1"
 	"github.com/containerd/typeurl"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestCreateTaskRequest(t *testing.T) {
@@ -29,10 +30,13 @@ func TestCreateTaskRequest(t *testing.T) {
   value: "\n\010type_url\022\013config_path"
 >`
 	got := &shim.CreateTaskRequest{} // Should have raw options.
-	if err := proto.UnmarshalText(encodedText, got); err != nil {
+	if err := prototext.Unmarshal([]byte(encodedText), got); err != nil {
 		t.Fatalf("unable to unmarshal text: %v", err)
 	}
-	t.Logf("got: %s", proto.MarshalTextString(got))
+	text, err := prototext.Marshal(got)
+	if err == nil {
+		t.Logf("got: %s", text)
+	}
 
 	// Check the options.
 	wantOptions := &Options{}
