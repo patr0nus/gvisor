@@ -643,6 +643,9 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 				continue
 			}
 
+			// Save the current parse offset.
+			parseOffset := it.ParseOffset()
+
 			// Don't consume the iterator if we have the first fragment because we
 			// will use it to validate that the first fragment holds the upper layer
 			// header.
@@ -708,7 +711,21 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			if int(start)+fragmentPayloadLen > header.IPv6MaximumPayloadSize {
 				r.Stats().IP.MalformedPacketsReceived.Increment()
 				r.Stats().IP.MalformedFragmentsReceived.Increment()
+				_ = returnError(r, &icmpReasonParameterProblem{
+					code:    header.ICMPv6ErroneousHeader,
+					pointer: parseOffset,
+				}, pkt)
 				return
+			}
+
+			// Save the packet if this is the first fragment. We'll use it to send an
+			// ICMP error message.
+			var pktToSave *stack.PacketBuffer
+			var routeToSave *stack.Route
+			if extHdr.FragmentOffset() == 0 {
+				pktToSave = pkt.Clone()
+				route := r.Clone()
+				routeToSave = &route
 			}
 
 			// Note that pkt doesn't have its transport header set after reassembly,
@@ -726,6 +743,8 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 				extHdr.More(),
 				uint8(rawPayload.Identifier),
 				rawPayload.Buf,
+				pktToSave,
+				routeToSave,
 			)
 			if err != nil {
 				r.Stats().IP.MalformedPacketsReceived.Increment()
@@ -1376,11 +1395,22 @@ type Options struct {
 func NewProtocolWithOptions(opts Options) stack.NetworkProtocolFactory {
 	opts.NDPConfigs.validate()
 
+	paramError := func(r *stack.Route, pkt *stack.PacketBuffer) {
+		_ = returnError(r, &icmpReasonParameterProblem{
+			code:    header.ICMPv6ErroneousHeader,
+			pointer: header.IPv6PayloadLenOffset,
+		}, pkt)
+	}
+	timeoutError := func(r *stack.Route, pkt *stack.PacketBuffer) {
+		_ = returnError(r, &icmpReasonReassemblyTimeout{
+			code: header.ICMPv6ReassemblyTimeout,
+		}, pkt)
+	}
+
 	return func(s *stack.Stack) stack.NetworkProtocol {
 		p := &protocol{
-			stack:         s,
-			fragmentation: fragmentation.NewFragmentation(header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout, s.Clock()),
-
+			stack:                s,
+			fragmentation:        fragmentation.NewFragmentation(header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout, s.Clock(), paramError, timeoutError),
 			ndpDisp:              opts.NDPDisp,
 			ndpConfigs:           opts.NDPConfigs,
 			opaqueIIDOpts:        opts.OpaqueIIDOpts,

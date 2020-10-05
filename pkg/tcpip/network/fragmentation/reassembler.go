@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 type hole struct {
@@ -41,6 +42,8 @@ type reassembler struct {
 	heap         fragHeap
 	done         bool
 	creationTime int64
+	pkt          *stack.PacketBuffer
+	route        *stack.Route
 }
 
 func newReassembler(id FragmentID, clock tcpip.Clock) *reassembler {
@@ -122,4 +125,21 @@ func (r *reassembler) checkDoneOrMark() bool {
 	r.done = true
 	r.mu.Unlock()
 	return prev
+}
+
+func (r *reassembler) savePacketAndRoute(pkt *stack.PacketBuffer, route *stack.Route) {
+	r.mu.Lock()
+	r.pkt = pkt
+	r.route = route
+	r.mu.Unlock()
+}
+
+func (r *reassembler) clearPacketAndRoute() (*stack.PacketBuffer, *stack.Route) {
+	r.mu.Lock()
+	pkt := r.pkt
+	r.pkt = nil
+	route := r.route
+	r.route = nil
+	r.mu.Unlock()
+	return pkt, route
 }

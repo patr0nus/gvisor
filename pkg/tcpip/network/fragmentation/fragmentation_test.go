@@ -22,6 +22,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 // vv is a helper to build VectorisedView from different strings.
@@ -33,6 +34,8 @@ func vv(size int, pieces ...string) buffer.VectorisedView {
 
 	return buffer.NewVectorisedView(size, views)
 }
+
+func nullError(*stack.Route, *stack.PacketBuffer) {}
 
 type processInput struct {
 	id    FragmentID
@@ -96,10 +99,10 @@ var processTestCases = []struct {
 func TestFragmentationProcess(t *testing.T) {
 	for _, c := range processTestCases {
 		t.Run(c.comment, func(t *testing.T) {
-			f := NewFragmentation(minBlockSize, 1024, 512, DefaultReassembleTimeout, &faketime.NullClock{})
+			f := NewFragmentation(minBlockSize, 1024, 512, DefaultReassembleTimeout, &faketime.NullClock{}, nullError, nullError)
 			firstFragmentProto := c.in[0].proto
 			for i, in := range c.in {
-				vv, proto, done, err := f.Process(in.id, in.first, in.last, in.more, in.proto, in.vv)
+				vv, proto, done, err := f.Process(in.id, in.first, in.last, in.more, in.proto, in.vv, nil, nil)
 				if err != nil {
 					t.Fatalf("f.Process(%+v, %d, %d, %t, %d, %X) failed: %s",
 						in.id, in.first, in.last, in.more, in.proto, in.vv.ToView(), err)
@@ -230,11 +233,11 @@ func TestReassemblingTimeout(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			clock := faketime.NewManualClock()
-			f := NewFragmentation(minBlockSize, HighFragThreshold, LowFragThreshold, reassemblyTimeout, clock)
+			f := NewFragmentation(minBlockSize, HighFragThreshold, LowFragThreshold, reassemblyTimeout, clock, nullError, nullError)
 			for _, event := range test.events {
 				clock.Advance(event.clockAdvance)
 				if frag := event.fragment; frag != nil {
-					_, _, done, err := f.Process(FragmentID{}, frag.first, frag.last, frag.more, protocol, vv(len(frag.data), frag.data))
+					_, _, done, err := f.Process(FragmentID{}, frag.first, frag.last, frag.more, protocol, vv(len(frag.data), frag.data), nil, nil)
 					if err != nil {
 						t.Fatalf("%s: f.Process failed: %s", event.name, err)
 					}
@@ -251,17 +254,17 @@ func TestReassemblingTimeout(t *testing.T) {
 }
 
 func TestMemoryLimits(t *testing.T) {
-	f := NewFragmentation(minBlockSize, 3, 1, DefaultReassembleTimeout, &faketime.NullClock{})
+	f := NewFragmentation(minBlockSize, 3, 1, DefaultReassembleTimeout, &faketime.NullClock{}, nullError, nullError)
 	// Send first fragment with id = 0.
-	f.Process(FragmentID{ID: 0}, 0, 0, true, 0xFF, vv(1, "0"))
+	f.Process(FragmentID{ID: 0}, 0, 0, true, 0xFF, vv(1, "0"), nil, nil)
 	// Send first fragment with id = 1.
-	f.Process(FragmentID{ID: 1}, 0, 0, true, 0xFF, vv(1, "1"))
+	f.Process(FragmentID{ID: 1}, 0, 0, true, 0xFF, vv(1, "1"), nil, nil)
 	// Send first fragment with id = 2.
-	f.Process(FragmentID{ID: 2}, 0, 0, true, 0xFF, vv(1, "2"))
+	f.Process(FragmentID{ID: 2}, 0, 0, true, 0xFF, vv(1, "2"), nil, nil)
 
 	// Send first fragment with id = 3. This should caused id = 0 and id = 1 to be
 	// evicted.
-	f.Process(FragmentID{ID: 3}, 0, 0, true, 0xFF, vv(1, "3"))
+	f.Process(FragmentID{ID: 3}, 0, 0, true, 0xFF, vv(1, "3"), nil, nil)
 
 	if _, ok := f.reassemblers[FragmentID{ID: 0}]; ok {
 		t.Errorf("Memory limits are not respected: id=0 has not been evicted.")
@@ -275,11 +278,11 @@ func TestMemoryLimits(t *testing.T) {
 }
 
 func TestMemoryLimitsIgnoresDuplicates(t *testing.T) {
-	f := NewFragmentation(minBlockSize, 1, 0, DefaultReassembleTimeout, &faketime.NullClock{})
+	f := NewFragmentation(minBlockSize, 1, 0, DefaultReassembleTimeout, &faketime.NullClock{}, nullError, nullError)
 	// Send first fragment with id = 0.
-	f.Process(FragmentID{}, 0, 0, true, 0xFF, vv(1, "0"))
+	f.Process(FragmentID{}, 0, 0, true, 0xFF, vv(1, "0"), nil, nil)
 	// Send the same packet again.
-	f.Process(FragmentID{}, 0, 0, true, 0xFF, vv(1, "0"))
+	f.Process(FragmentID{}, 0, 0, true, 0xFF, vv(1, "0"), nil, nil)
 
 	got := f.size
 	want := 1
@@ -370,8 +373,8 @@ func TestErrors(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			f := NewFragmentation(test.blockSize, HighFragThreshold, LowFragThreshold, DefaultReassembleTimeout, &faketime.NullClock{})
-			_, _, done, err := f.Process(FragmentID{}, test.first, test.last, test.more, 0, vv(len(test.data), test.data))
+			f := NewFragmentation(test.blockSize, HighFragThreshold, LowFragThreshold, DefaultReassembleTimeout, &faketime.NullClock{}, nullError, nullError)
+			_, _, done, err := f.Process(FragmentID{}, test.first, test.last, test.more, 0, vv(len(test.data), test.data), nil, nil)
 			if !errors.Is(err, test.err) {
 				t.Errorf("got Process(_, %d, %d, %t, _, %q) = (_, _, _, %v), want = (_, _, _, %v)", test.first, test.last, test.more, test.data, err, test.err)
 			}

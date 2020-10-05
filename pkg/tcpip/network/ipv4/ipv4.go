@@ -545,6 +545,8 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 			h.More(),
 			proto,
 			pkt.Data,
+			nil,
+			nil,
 		)
 		if err != nil {
 			r.Stats().IP.MalformedPacketsReceived.Increment()
@@ -831,11 +833,16 @@ func NewProtocol(s *stack.Stack) stack.NetworkProtocol {
 	}
 	hashIV := r[buckets]
 
+	// TODO(gvisor.dev/issue/4428): ICMP Error message should be sent if IPv4
+	// fragment reassembly fails.
+	paramError := func(*stack.Route, *stack.PacketBuffer) {}
+	timeoutError := func(*stack.Route, *stack.PacketBuffer) {}
+
 	return &protocol{
 		stack:         s,
 		ids:           ids,
 		hashIV:        hashIV,
 		defaultTTL:    DefaultTTL,
-		fragmentation: fragmentation.NewFragmentation(fragmentblockSize, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout, s.Clock()),
+		fragmentation: fragmentation.NewFragmentation(fragmentblockSize, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout, s.Clock(), paramError, timeoutError),
 	}
 }

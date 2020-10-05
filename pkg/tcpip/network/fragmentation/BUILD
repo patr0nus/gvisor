@@ -29,6 +29,7 @@ go_library(
         "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/buffer",
+        "//pkg/tcpip/stack",
     ],
 )
 
@@ -44,5 +45,6 @@ go_test(
     deps = [
         "//pkg/tcpip/buffer",
         "//pkg/tcpip/faketime",
+        "//pkg/tcpip/stack",
     ],
 )

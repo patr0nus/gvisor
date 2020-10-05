@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 const (
@@ -83,6 +84,8 @@ type Fragmentation struct {
 	blockSize    uint16
 	clock        tcpip.Clock
 	releaseJob   *tcpip.Job
+	paramError   func(r *stack.Route, pkt *stack.PacketBuffer)
+	timeoutError func(r *stack.Route, pkt *stack.PacketBuffer)
 }
 
 // NewFragmentation creates a new Fragmentation.
@@ -99,7 +102,7 @@ type Fragmentation struct {
 // reassemblingTimeout specifies the maximum time allowed to reassemble a packet.
 // Fragments are lazily evicted only when a new a packet with an
 // already existing fragmentation-id arrives after the timeout.
-func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, reassemblingTimeout time.Duration, clock tcpip.Clock) *Fragmentation {
+func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, reassemblingTimeout time.Duration, clock tcpip.Clock, paramError func(r *stack.Route, pkt *stack.PacketBuffer), timeoutError func(r *stack.Route, pkt *stack.PacketBuffer)) *Fragmentation {
 	if lowMemoryLimit >= highMemoryLimit {
 		lowMemoryLimit = highMemoryLimit
 	}
@@ -119,6 +122,8 @@ func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, rea
 		timeout:      reassemblingTimeout,
 		blockSize:    blockSize,
 		clock:        clock,
+		paramError:   paramError,
+		timeoutError: timeoutError,
 	}
 	f.releaseJob = tcpip.NewJob(f.clock, &f.mu, f.releaseReassemblersLocked)
 
@@ -138,8 +143,12 @@ func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, rea
 // proto is the protocol number marked in the fragment being processed. It has
 // to be given here outside of the FragmentID struct because IPv6 should not use
 // the protocol to identify a fragment.
+//
+// pkt and route are passed if this is the first fragment of the packet. They
+// are saved in the reassembler so that we can send an ICMP error message on
+// reassembly timeout.
 func (f *Fragmentation) Process(
-	id FragmentID, first, last uint16, more bool, proto uint8, vv buffer.VectorisedView) (
+	id FragmentID, first, last uint16, more bool, proto uint8, vv buffer.VectorisedView, pkt *stack.PacketBuffer, route *stack.Route) (
 	buffer.VectorisedView, uint8, bool, error) {
 	if first > last {
 		return buffer.VectorisedView{}, 0, false, fmt.Errorf("first=%d is greater than last=%d: %w", first, last, ErrInvalidArgs)
@@ -151,6 +160,7 @@ func (f *Fragmentation) Process(
 
 	fragmentSize := last - first + 1
 	if more && fragmentSize%f.blockSize != 0 {
+		f.paramError(route, pkt)
 		return buffer.VectorisedView{}, 0, false, fmt.Errorf("fragment size=%d bytes is not a multiple of block size=%d on non-final fragment: %w", fragmentSize, f.blockSize, ErrInvalidArgs)
 	}
 
@@ -188,6 +198,9 @@ func (f *Fragmentation) Process(
 	f.size += consumed
 	if done {
 		f.release(r)
+	} else {
+		// Save the packet and route so we can send an ICMP error on reassembly timeout.
+		r.savePacketAndRoute(pkt, route)
 	}
 	// Evict reassemblers if we are consuming more memory than highLimit until
 	// we reach lowLimit.
@@ -209,6 +222,11 @@ func (f *Fragmentation) release(r *reassembler) {
 	// Otherwise, we would delete it twice.
 	if r.checkDoneOrMark() {
 		return
+	}
+
+	// Release the saved route.
+	if pkt, route := r.clearPacketAndRoute(); pkt != nil {
+		route.Release()
 	}
 
 	delete(f.reassemblers, r.id)
@@ -240,6 +258,10 @@ func (f *Fragmentation) releaseReassemblersLocked() {
 			break
 		}
 		// If the oldest reassembler has already expired, release it.
+		if pkt, route := r.clearPacketAndRoute(); pkt != nil {
+			f.timeoutError(route, pkt)
+			route.Release()
+		}
 		f.release(r)
 	}
 }
