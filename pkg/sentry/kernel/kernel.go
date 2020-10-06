@@ -841,14 +841,16 @@ func (ctx *createProcessContext) Value(key interface{}) interface{} {
 		if ctx.args.MountNamespaceVFS2 == nil {
 			return nil
 		}
-		// MountNamespaceVFS2.Root() takes a reference on the root dirent for us.
-		return ctx.args.MountNamespaceVFS2.Root()
+		root := ctx.args.MountNamespaceVFS2.Root()
+		root.IncRef()
+		return root
 	case vfs.CtxMountNamespace:
 		if ctx.k.globalInit == nil {
 			return nil
 		}
-		// MountNamespaceVFS2 takes a reference for us.
-		return ctx.k.GlobalInit().Leader().MountNamespaceVFS2()
+		mntns := ctx.k.GlobalInit().Leader().MountNamespaceVFS2()
+		mntns.IncRef()
+		return mntns
 	case fs.CtxDirentCacheLimiter:
 		return ctx.k.DirentCacheLimiter
 	case inet.CtxStack:
@@ -904,14 +906,13 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	if VFS2Enabled {
 		mntnsVFS2 = args.MountNamespaceVFS2
 		if mntnsVFS2 == nil {
-			// MountNamespaceVFS2 adds a reference to the namespace, which is
-			// transferred to the new process.
+			// Add a reference to the namespace, which is transferred to the new process.
 			mntnsVFS2 = k.globalInit.Leader().MountNamespaceVFS2()
+			mntnsVFS2.IncRef()
 		}
 		// Get the root directory from the MountNamespace.
 		root := mntnsVFS2.Root()
-		// The call to newFSContext below will take a reference on root, so we
-		// don't need to hold this one.
+		root.IncRef()
 		defer root.DecRef(ctx)
 
 		// Grab the working directory.
@@ -1648,16 +1649,16 @@ func (ctx supervisorContext) Value(key interface{}) interface{} {
 		if ctx.k.globalInit == nil {
 			return vfs.VirtualDentry{}
 		}
-		mntns := ctx.k.GlobalInit().Leader().MountNamespaceVFS2()
-		defer mntns.DecRef(ctx)
-		// Root() takes a reference on the root dirent for us.
-		return mntns.Root()
+		root := ctx.k.GlobalInit().Leader().MountNamespaceVFS2().Root()
+		root.IncRef()
+		return root
 	case vfs.CtxMountNamespace:
 		if ctx.k.globalInit == nil {
 			return nil
 		}
-		// MountNamespaceVFS2() takes a reference for us.
-		return ctx.k.GlobalInit().Leader().MountNamespaceVFS2()
+		mntns := ctx.k.GlobalInit().Leader().MountNamespaceVFS2()
+		mntns.IncRef()
+		return mntns
 	case fs.CtxDirentCacheLimiter:
 		return ctx.k.DirentCacheLimiter
 	case inet.CtxStack:
@@ -1737,4 +1738,21 @@ func (k *Kernel) ShmMount() *vfs.Mount {
 // SocketMount returns the sockfs mount.
 func (k *Kernel) SocketMount() *vfs.Mount {
 	return k.socketMount
+}
+
+// Release releases resources owned by k.
+//
+// Precondition: This should only be called after the kernel is fully
+// initialized, e.g. after k.Start() has been called.
+func (k *Kernel) Release() {
+	ctx := k.SupervisorContext()
+	if VFS2Enabled {
+		k.hostMount.DecRef(ctx)
+		k.pipeMount.DecRef(ctx)
+		k.shmMount.DecRef(ctx)
+		k.socketMount.DecRef(ctx)
+		k.vfs.Release(ctx)
+	}
+	k.timekeeper.Destroy()
+	k.vdso.Release(ctx)
 }
