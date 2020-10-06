@@ -41,6 +41,9 @@ func (FilesystemType) Name() string {
 	return Name
 }
 
+// Release implements vfs.FilesystemType.Release.
+func (FilesystemType) Release(ctx context.Context) {}
+
 // +stateify savable
 type filesystem struct {
 	kernfs.Filesystem

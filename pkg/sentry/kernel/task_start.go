@@ -16,6 +16,7 @@ package kernel
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -98,14 +99,20 @@ type TaskConfig struct {
 // NewTask creates a new task defined by cfg.
 //
 // NewTask does not start the returned task; the caller must call Task.Start.
-func (ts *TaskSet) NewTask(cfg *TaskConfig) (*Task, error) {
+//
+// On failure, NewTask releases all references held by cfg.
+func (ts *TaskSet) NewTask(ctx context.Context, cfg *TaskConfig, newThreadGroup bool) (*Task, error) {
 	t, err := ts.newTask(cfg)
 	if err != nil {
+		if newThreadGroup {
+			cfg.ThreadGroup.release(ctx)
+		}
 		cfg.TaskContext.release()
-		cfg.FSContext.DecRef(t)
-		cfg.FDTable.DecRef(t)
+		cfg.FSContext.DecRef(ctx)
+		cfg.FDTable.DecRef(ctx)
+		cfg.IPCNamespace.DecRef(ctx)
 		if cfg.MountNamespaceVFS2 != nil {
-			cfg.MountNamespaceVFS2.DecRef(t)
+			cfg.MountNamespaceVFS2.DecRef(ctx)
 		}
 		return nil, err
 	}

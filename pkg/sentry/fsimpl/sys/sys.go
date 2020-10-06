@@ -38,6 +38,8 @@ const defaultSysDirMode = linux.FileMode(0755)
 // +stateify savable
 type FilesystemType struct{}
 
+var _ vfs.FilesystemType = (*FilesystemType)(nil)
+
 // filesystem implements vfs.FilesystemImpl.
 //
 // +stateify savable
@@ -51,6 +53,9 @@ type filesystem struct {
 func (FilesystemType) Name() string {
 	return Name
 }
+
+// Release implements vfs.FilesystemType.Release.
+func (FilesystemType) Release(ctx context.Context) {}
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {

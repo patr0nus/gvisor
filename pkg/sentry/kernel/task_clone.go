@@ -203,6 +203,8 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 		// Note that "If CLONE_NEWIPC is set, then create the process in a new IPC
 		// namespace"
 		ipcns = NewIPCNamespace(userns)
+	} else {
+		ipcns.IncRef()
 	}
 
 	netns := t.NetworkNamespace()
@@ -218,6 +220,10 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 
 	tc, err := t.tc.Fork(t, t.k, !opts.NewAddressSpace)
 	if err != nil {
+		ipcns.DecRef(t)
+		if mntnsVFS2 != nil {
+			mntnsVFS2.DecRef(t)
+		}
 		return 0, nil, err
 	}
 	// clone() returns 0 in the child.
@@ -227,6 +233,11 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 	}
 	if opts.SetTLS {
 		if !tc.Arch.SetTLS(uintptr(opts.TLS)) {
+			ipcns.DecRef(t)
+			if mntnsVFS2 != nil {
+				mntnsVFS2.DecRef(t)
+			}
+			tc.release()
 			return 0, nil, syserror.EPERM
 		}
 	}
@@ -295,11 +306,8 @@ func (t *Task) Clone(opts *CloneOptions) (ThreadID, *SyscallControl, error) {
 	} else {
 		cfg.InheritParent = t
 	}
-	nt, err := t.tg.pidns.owner.NewTask(cfg)
+	nt, err := t.tg.pidns.owner.NewTask(t, cfg, opts.NewThreadGroup)
 	if err != nil {
-		if opts.NewThreadGroup {
-			tg.release(t)
-		}
 		return 0, nil, err
 	}
 
@@ -509,6 +517,7 @@ func (t *Task) Unshare(opts *SharingOptions) error {
 		}
 		// Note that "If CLONE_NEWIPC is set, then create the process in a new IPC
 		// namespace"
+		t.ipcns.DecRef(t)
 		t.ipcns = NewIPCNamespace(creds.UserNamespace)
 	}
 	var oldFDTable *FDTable

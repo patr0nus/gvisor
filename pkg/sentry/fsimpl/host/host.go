@@ -141,6 +141,8 @@ func ImportFD(ctx context.Context, mnt *vfs.Mount, hostFD int, isTTY bool) (*vfs
 // +stateify savable
 type filesystemType struct{}
 
+var _ vfs.FilesystemType = (*filesystemType)(nil)
+
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (filesystemType) GetFilesystem(context.Context, *vfs.VirtualFilesystem, *auth.Credentials, string, vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	panic("host.filesystemType.GetFilesystem should never be called")
@@ -150,6 +152,9 @@ func (filesystemType) GetFilesystem(context.Context, *vfs.VirtualFilesystem, *au
 func (filesystemType) Name() string {
 	return "none"
 }
+
+// Release implements vfs.FilesystemType.Release.
+func (filesystemType) Release(ctx context.Context) {}
 
 // NewFilesystem sets up and returns a new hostfs filesystem.
 //

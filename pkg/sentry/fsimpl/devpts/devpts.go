@@ -37,27 +37,53 @@ const Name = "devpts"
 // FilesystemType implements vfs.FilesystemType.
 //
 // +stateify savable
-type FilesystemType struct{}
+type FilesystemType struct {
+	initOnce sync.Once `state:"nosave"` // FIXME(gvisor.dev/issue/1664): not yet supported.
+	initErr  error
 
-// Name implements vfs.FilesystemType.Name.
-func (FilesystemType) Name() string {
-	return Name
+	// fs backs all mounts of this FilesystemType. root is fs' root. fs and root
+	// are immutable.
+	fs   *vfs.Filesystem
+	root *vfs.Dentry
 }
 
 var _ vfs.FilesystemType = (*FilesystemType)(nil)
 
+// Name implements vfs.FilesystemType.Name.
+func (*FilesystemType) Name() string {
+	return Name
+}
+
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
-func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
+func (fstype *FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	// No data allowed.
 	if opts.Data != "" {
 		return nil, nil, syserror.EINVAL
 	}
 
-	fs, root, err := fstype.newFilesystem(vfsObj, creds)
-	if err != nil {
-		return nil, nil, err
+	fstype.initOnce.Do(func() {
+		fs, root, err := fstype.newFilesystem(vfsObj, creds)
+		if err != nil {
+			fstype.initErr = err
+			return
+		}
+		fstype.fs = fs.VFSFilesystem()
+		fstype.root = root.VFSDentry()
+	})
+	if fstype.initErr != nil {
+		return nil, nil, fstype.initErr
 	}
-	return fs.Filesystem.VFSFilesystem(), root.VFSDentry(), nil
+	fstype.fs.IncRef()
+	fstype.root.IncRef()
+	return fstype.fs, fstype.root, nil
+}
+
+// Release implements vfs.FilesystemType.Release.
+func (fstype *FilesystemType) Release(ctx context.Context) {
+	if fstype.fs != nil {
+		fstype.fs.DecRef(ctx)
+		fstype.root.DecRef(ctx)
+	}
 }
 
 // +stateify savable
@@ -69,7 +95,7 @@ type filesystem struct {
 
 // newFilesystem creates a new devpts filesystem with root directory and ptmx
 // master inode. It returns the filesystem and root Dentry.
-func (fstype FilesystemType) newFilesystem(vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) (*filesystem, *kernfs.Dentry, error) {
+func (fstype *FilesystemType) newFilesystem(vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) (*filesystem, *kernfs.Dentry, error) {
 	devMinor, err := vfsObj.GetAnonBlockDevMinor()
 	if err != nil {
 		return nil, nil, err
