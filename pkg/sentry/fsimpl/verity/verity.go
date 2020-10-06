@@ -467,6 +467,12 @@ type fileDescription struct {
 	// directory that contains the current file/directory. This is only used
 	// if allowRuntimeEnable is set to true.
 	parentMerkleWriter *vfs.FileDescription
+
+	// lowerMu protects the offset of lowerFD and merkleReader. This is
+	// needed as their offsets can be modified during verification process.
+	// And it could cause race issue if multiple threads are accessing the
+	// same fileDescription to read.
+	lowerMu sync.Mutex `state:"nosave"`
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
@@ -725,6 +731,8 @@ func (fd *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, of
 		Ctx: ctx,
 	}
 
+	fd.lowerMu.Lock()
+	defer fd.lowerMu.Unlock()
 	n, err := merkletree.Verify(dst.Writer(ctx), &dataReader, &merkleReader, int64(size), offset, dst.NumBytes(), fd.d.rootHash, false /* dataAndTreeInSameFile */)
 	if err != nil {
 		return 0, alertIntegrityViolation(syserror.EINVAL, fmt.Sprintf("Verification failed: %v", err))
