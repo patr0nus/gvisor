@@ -158,6 +158,16 @@ func (vfs *VirtualFilesystem) Init(ctx context.Context) error {
 	return nil
 }
 
+// Release drops references on filesystem objects held by vfs.
+//
+// Precondition: This must be called after VFS.Init() has succeeded.
+func (vfs *VirtualFilesystem) Release(ctx context.Context) {
+	vfs.anonMount.DecRef(ctx)
+	for _, fst := range vfs.fsTypes {
+		fst.fsType.Release(ctx)
+	}
+}
+
 // PathOperation specifies the path operated on by a VFS method.
 //
 // PathOperation is passed to VFS methods by pointer to reduce memory copying:
