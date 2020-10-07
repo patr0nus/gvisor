@@ -46,16 +46,18 @@ type System struct {
 
 // NewSystem constructs a System.
 //
-// Precondition: Caller must hold a reference on MntNs, whose ownership
+// Precondition: Caller must hold a reference on mns, whose ownership
 // is transferred to the new System.
 func NewSystem(ctx context.Context, t *testing.T, v *vfs.VirtualFilesystem, mns *vfs.MountNamespace) *System {
+	root := mns.Root()
+	root.IncRef()
 	s := &System{
 		t:     t,
 		Ctx:   ctx,
 		Creds: auth.CredentialsFromContext(ctx),
 		VFS:   v,
 		MntNs: mns,
-		Root:  mns.Root(),
+		Root:  root,
 	}
 	return s
 }

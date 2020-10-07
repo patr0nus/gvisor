@@ -32,6 +32,8 @@ import (
 // +stateify savable
 type filesystemType struct{}
 
+var _ vfs.FilesystemType = (*filesystemType)(nil)
+
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fsType filesystemType) GetFilesystem(_ context.Context, vfsObj *vfs.VirtualFilesystem, _ *auth.Credentials, _ string, _ vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	panic("sockfs.filesystemType.GetFilesystem should never be called")
@@ -45,6 +47,9 @@ func (fsType filesystemType) GetFilesystem(_ context.Context, vfsObj *vfs.Virtua
 func (filesystemType) Name() string {
 	return "sockfs"
 }
+
+// Release implements vfs.FilesystemType.Release.
+func (filesystemType) Release(ctx context.Context) {}
 
 // +stateify savable
 type filesystem struct {

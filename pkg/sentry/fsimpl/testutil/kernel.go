@@ -147,7 +147,7 @@ func CreateTask(ctx context.Context, name string, tc *kernel.ThreadGroup, mntns 
 		FSContext:               kernel.NewFSContextVFS2(root, cwd, 0022),
 		FDTable:                 k.NewFDTable(),
 	}
-	return k.TaskSet().NewTask(config)
+	return k.TaskSet().NewTask(ctx, config, true /* newThreadGroup */)
 }
 
 func newFakeExecutable(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry) (*vfs.FileDescription, error) {

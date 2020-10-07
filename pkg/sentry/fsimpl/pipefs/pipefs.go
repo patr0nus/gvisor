@@ -34,10 +34,15 @@ import (
 // +stateify savable
 type filesystemType struct{}
 
+var _ vfs.FilesystemType = (*filesystemType)(nil)
+
 // Name implements vfs.FilesystemType.Name.
 func (filesystemType) Name() string {
 	return "pipefs"
 }
+
+// Release implements vfs.FilesystemType.Release.
+func (filesystemType) Release(ctx context.Context) {}
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (filesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {

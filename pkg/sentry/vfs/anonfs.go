@@ -56,15 +56,20 @@ const (
 // +stateify savable
 type anonFilesystemType struct{}
 
+var _ FilesystemType = (*anonFilesystemType)(nil)
+
 // GetFilesystem implements FilesystemType.GetFilesystem.
 func (anonFilesystemType) GetFilesystem(context.Context, *VirtualFilesystem, *auth.Credentials, string, GetFilesystemOptions) (*Filesystem, *Dentry, error) {
 	panic("cannot instaniate an anon filesystem")
 }
 
-// Name implemenents FilesystemType.Name.
+// Name implements FilesystemType.Name.
 func (anonFilesystemType) Name() string {
 	return "none"
 }
+
+// Release implemenents FilesystemType.Release.
+func (anonFilesystemType) Release(ctx context.Context) {}
 
 // anonFilesystem is the implementation of FilesystemImpl that backs
 // VirtualDentries returned by VirtualFilesystem.NewAnonVirtualDentry().
