@@ -2467,7 +2467,7 @@ func TestFragmentationErrors(t *testing.T) {
 			wantError:      tcpip.ErrAborted,
 		},
 		{
-			description:    "Error on packet with MTU smaller than transport header",
+			description:    "Error when MTU is smaller than transport header",
 			mtu:            1280,
 			transHdrLen:    1500,
 			payloadSize:    500,
@@ -2475,6 +2475,16 @@ func TestFragmentationErrors(t *testing.T) {
 			outgoingErrors: 1,
 			mockError:      nil,
 			wantError:      tcpip.ErrMessageTooLong,
+		},
+		{
+			description:    "Error when MTU is smaller than IPv6 minimum MTU",
+			mtu:            header.IPv6MinimumMTU - 1,
+			transHdrLen:    0,
+			payloadSize:    500,
+			allowPackets:   0,
+			outgoingErrors: 1,
+			mockError:      nil,
+			wantError:      tcpip.ErrInvalidEndpointState,
 		},
 	}
 

@@ -1411,7 +1411,7 @@ func TestWriteStats(t *testing.T) {
 		t.Run(writer.name, func(t *testing.T) {
 			for _, test := range tests {
 				t.Run(test.name, func(t *testing.T) {
-					ep := testutil.NewMockLinkEndpoint(header.IPv4MinimumSize+header.UDPMinimumSize, tcpip.ErrInvalidEndpointState, test.allowPackets)
+					ep := testutil.NewMockLinkEndpoint(header.IPv4MinimumMTU, tcpip.ErrInvalidEndpointState, test.allowPackets)
 					rt := buildRoute(t, ep)
 
 					var pkts stack.PacketBufferList

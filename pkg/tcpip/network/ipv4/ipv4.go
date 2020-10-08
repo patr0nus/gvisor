@@ -273,8 +273,13 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 	if r.Loop&stack.PacketOut == 0 {
 		return nil
 	}
-	if pkt.Size() > int(e.nic.MTU()) && (gso == nil || gso.Type == stack.GSONone) {
-		return e.writePacketFragments(r, gso, e.nic.MTU(), pkt)
+	mtu := e.nic.MTU()
+	if mtu < header.IPv4MinimumMTU {
+		r.Stats().IP.OutgoingPacketErrors.Increment()
+		return tcpip.ErrInvalidEndpointState
+	}
+	if pkt.Size() > int(mtu) && (gso == nil || gso.Type == stack.GSONone) {
+		return e.writePacketFragments(r, gso, mtu, pkt)
 	}
 	if err := e.nic.WritePacket(r, gso, ProtocolNumber, pkt); err != nil {
 		r.Stats().IP.OutgoingPacketErrors.Increment()
@@ -291,6 +296,12 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 	}
 	if r.Loop&stack.PacketOut == 0 {
 		return pkts.Len(), nil
+	}
+
+	mtu := e.nic.MTU()
+	if mtu < header.IPv4MinimumMTU {
+		r.Stats().IP.OutgoingPacketErrors.Increment()
+		return pkts.Len(), tcpip.ErrInvalidEndpointState
 	}
 
 	for pkt := pkts.Front(); pkt != nil; {
@@ -394,6 +405,10 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 		return nil
 	}
 
+	if e.nic.MTU() < header.IPv6MinimumMTU {
+		r.Stats().IP.OutgoingPacketErrors.Increment()
+		return tcpip.ErrInvalidEndpointState
+	}
 	if err := e.nic.WritePacket(r, nil /* gso */, ProtocolNumber, pkt); err != nil {
 		r.Stats().IP.OutgoingPacketErrors.Increment()
 		return err
@@ -730,6 +745,9 @@ func (p *protocol) SetForwarding(v bool) {
 // calculateMTU calculates the network-layer payload MTU based on the link-layer
 // payload mtu.
 func calculateMTU(mtu uint32) uint32 {
+	if mtu < header.IPv4MinimumSize {
+		return 0
+	}
 	if mtu > MaxTotalSize {
 		mtu = MaxTotalSize
 	}
