@@ -320,6 +320,7 @@ func TestSourceAddressValidation(t *testing.T) {
 			SrcAddr:     src,
 			DstAddr:     localIPv4Addr,
 		})
+		ip.SetChecksum(^ip.CalculateChecksum())
 
 		e.InjectInbound(header.IPv4ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Data: hdr.View().ToVectorisedView(),
@@ -342,7 +343,6 @@ func TestSourceAddressValidation(t *testing.T) {
 			SrcAddr:       src,
 			DstAddr:       localIPv6Addr,
 		})
-
 		e.InjectInbound(header.IPv6ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Data: hdr.View().ToVectorisedView(),
 		}))
@@ -579,6 +579,7 @@ func TestIPv4Receive(t *testing.T) {
 		SrcAddr:     remoteIPv4Addr,
 		DstAddr:     localIPv4Addr,
 	})
+	ip.SetChecksum(^ip.CalculateChecksum())
 
 	// Make payload be non-zero.
 	for i := header.IPv4MinimumSize; i < totalLen; i++ {
@@ -660,6 +661,7 @@ func TestIPv4ReceiveControl(t *testing.T) {
 				SrcAddr:     "\x0a\x00\x00\xbb",
 				DstAddr:     localIPv4Addr,
 			})
+			ip.SetChecksum(^ip.CalculateChecksum())
 
 			// Create the ICMP header.
 			icmp := header.ICMPv4(view[header.IPv4MinimumSize:])
@@ -679,6 +681,7 @@ func TestIPv4ReceiveControl(t *testing.T) {
 				SrcAddr:        localIPv4Addr,
 				DstAddr:        remoteIPv4Addr,
 			})
+			ip.SetChecksum(^ip.CalculateChecksum())
 
 			// Make payload be non-zero.
 			for i := dataOffset; i < len(view); i++ {
@@ -732,6 +735,7 @@ func TestIPv4FragmentationReceive(t *testing.T) {
 		SrcAddr:        remoteIPv4Addr,
 		DstAddr:        localIPv4Addr,
 	})
+	ip1.SetChecksum(^ip1.CalculateChecksum())
 	// Make payload be non-zero.
 	for i := header.IPv4MinimumSize; i < totalLen; i++ {
 		frag1[i] = uint8(i)
@@ -748,6 +752,9 @@ func TestIPv4FragmentationReceive(t *testing.T) {
 		SrcAddr:        remoteIPv4Addr,
 		DstAddr:        localIPv4Addr,
 	})
+
+	ip2.SetChecksum(^ip2.CalculateChecksum())
+
 	// Make payload be non-zero.
 	for i := header.IPv4MinimumSize; i < totalLen; i++ {
 		frag2[i] = uint8(i)

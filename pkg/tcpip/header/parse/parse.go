@@ -63,6 +63,10 @@ func IPv4(pkt *stack.PacketBuffer) bool {
 
 	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
 	pkt.Data.CapLength(int(ipHdr.TotalLength()) - len(hdr))
+	xsum := ipHdr.CalculateChecksum()
+	if xsum != 0 && xsum != 0xffff {
+		return false
+	}
 	return true
 }
 
