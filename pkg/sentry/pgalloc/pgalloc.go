@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
@@ -829,6 +830,11 @@ func (f *MemoryFile) UpdateUsage() error {
 		return nil
 	}
 
+	// Linux updates usage values at CONFIG_HZ.
+	if scanningAfter := time.Now().Sub(f.usageLast).Milliseconds(); scanningAfter < time.Second.Milliseconds()/linux.CLOCKS_PER_SEC {
+		log.Debugf("UpdateUsage: skipped because previous scan happened %d ms back", scanningAfter)
+		return nil
+	}
 	f.usageLast = time.Now()
 	err = f.updateUsageLocked(currentUsage, mincore)
 	log.Debugf("UpdateUsage: currentUsage=%d, usageExpected=%d, usageSwapped=%d.",
@@ -841,7 +847,7 @@ func (f *MemoryFile) UpdateUsage() error {
 // pages by invoking checkCommitted, which is a function that, for each page i
 // in bs, sets committed[i] to 1 if the page is committed and 0 otherwise.
 //
-// Precondition: f.mu must be held.
+// Precondition: f.mu must be held; it may be unlocked and reacquired.
 func (f *MemoryFile) updateUsageLocked(currentUsage uint64, checkCommitted func(bs []byte, committed []byte) error) error {
 	// Track if anything changed to elide the merge. In the common case, we
 	// expect all segments to be committed and no merge to occur.
@@ -868,7 +874,7 @@ func (f *MemoryFile) updateUsageLocked(currentUsage uint64, checkCommitted func(
 		} else if f.usageSwapped != 0 {
 			// We have more usage accounted for than the file itself.
 			// That's fine, we probably caught a race where pages were
-			// being committed while the above loop was running. Just
+			// being committed while the below loop was running. Just
 			// report the higher number that we found and ignore swap.
 			usage.MemoryAccounting.Dec(f.usageSwapped, usage.System)
 			f.usageSwapped = 0
@@ -900,6 +906,7 @@ func (f *MemoryFile) updateUsageLocked(currentUsage uint64, checkCommitted func(
 
 		// Get the range for this segment. As we touch slices, the
 		// Start value will be walked along.
+	retryRange:
 		r := seg.Range()
 
 		var checkErr error
@@ -917,10 +924,16 @@ func (f *MemoryFile) updateUsageLocked(currentUsage uint64, checkCommitted func(
 			}
 
 			// Query for new pages in core.
+			// NOTE(b/165896008): mincore (which is passed as checkCommitted)
+			// by f.UpdateUsage() might take a really long time. So unlock f.mu
+			// while checkCommitted runs.
+			f.mu.Unlock()
 			if err := checkCommitted(s, buf); err != nil {
 				checkErr = err
+				f.mu.Lock()
 				return
 			}
+			f.mu.Lock()
 
 			// Scan each page and switch out segments.
 			populatedRun := false
@@ -978,6 +991,14 @@ func (f *MemoryFile) updateUsageLocked(currentUsage uint64, checkCommitted func(
 		if err != nil {
 			return err
 		}
+		// The segment tree might have been updated while f.mu was unlocked.
+		updatedSeg := f.usage.FindSegment(r.Start)
+		if updatedSeg.End() > seg.End() {
+			// Our current segment expanded while f.mu was unlocked.
+			r = memmap.FileRange{Start: seg.End(), End: updatedSeg.End()}
+			goto retryRange
+		}
+		seg = updatedSeg
 	}
 
 	return nil
